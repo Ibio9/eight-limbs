@@ -1,0 +1,2673 @@
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Eight Limbs</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #050405; overflow: hidden; }
+  canvas { display: block; outline: none; }
+</style>
+</head>
+<body>
+<canvas id="game" tabindex="0"></canvas>
+<script id="logic">
+/* ==========================================================================
+   PURE GAME LOGIC. No DOM, no canvas, no audio. Everything the theory claims
+   lives here and is what the fight actually runs on.
+   ========================================================================== */
+var EL = (function () {
+  'use strict';
+
+  /* ---------- Random numbers (seedable so checks are reproducible) ---------- */
+  function makeRng(seed) {
+    var a = (seed >>> 0) || 1;
+    return function () {
+      a = (a + 0x6D2B79F5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function gauss(rng) {
+    var u = 1 - rng(), v = rng();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+  function sampleMix(mix, keys, rng) {
+    var r = rng(), acc = 0;
+    for (var i = 0; i < keys.length; i++) {
+      acc += mix[keys[i]];
+      if (r < acc) return keys[i];
+    }
+    return keys[keys.length - 1];
+  }
+  function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+
+  /* ---------- Techniques ---------- */
+  // score: judging value of a clean technique (kicks and knees above punches)
+  // dmg: damage of a clean hit; windup/recover in seconds; reach in px (centre to centre)
+  var TECH = {
+    punch: { name: 'Punch', score: 2, dmg: 4, cost: 4, windup: 0.11, recover: 0.17, reach: 200 },
+    elbow: { name: 'Elbow', score: 3, dmg: 8, cost: 6, windup: 0.15, recover: 0.22, reach: 118 },
+    teep: { name: 'Teep', score: 2.5, dmg: 3, cost: 6, windup: 0.19, recover: 0.25, reach: 292 },
+    low: { name: 'Low kick', score: 3, dmg: 5, cost: 7, windup: 0.22, recover: 0.26, reach: 205 },
+    body: { name: 'Body kick', score: 4, dmg: 7, cost: 9, windup: 0.27, recover: 0.30, reach: 292 },
+    knee: { name: 'Knee', score: 4, dmg: 8, cost: 8, windup: 0.22, recover: 0.27, reach: 118 },
+    head: { name: 'Head kick', score: 6, dmg: 12, cost: 12, windup: 0.35, recover: 0.38, reach: 292 }
+  };
+  var STAGGER_DMG = 7;          // clean hits at or above this make the victim visibly react
+  var STAGGER_POINTS = 1;       // ...which costs the victim this much with the judges
+
+  var RANGE = { close: 112, mid: 198, long: 288 };
+  function bandOf(dist) {
+    if (dist < RANGE.close) return 'close';
+    if (dist < RANGE.mid) return 'mid';
+    if (dist < RANGE.long) return 'long';
+    return 'out';
+  }
+
+  var BANDS = ['long', 'mid', 'close', 'clinch'];
+  var STRIKE_BANDS = ['long', 'mid', 'close'];
+  var DEFENCES = ['guard', 'check', 'lean', 'catch', 'step'];
+  var BAND_ATTACKS = {
+    long: ['teep', 'body', 'head'],
+    mid: ['punch', 'body', 'head', 'low'],
+    close: ['elbow', 'knee'],
+    clinch: ['cknee', 'pull', 'shift']
+  };
+  var LABEL = {
+    punch: 'Punch', elbow: 'Elbow', teep: 'Teep', low: 'Low kick', body: 'Body kick', knee: 'Knee', head: 'Head kick',
+    guard: 'Guard', check: 'Check', lean: 'Lean back', 'catch': 'Catch', step: 'Step back', none: 'No defence',
+    cknee: 'Knee', pull: 'Pull down', shift: 'Shift weight'
+  };
+
+  /* ---------- What happens when an attack meets a defence ---------- */
+  // Outcome types per range band. This single table drives both the payoff
+  // matrices (and so the equilibrium) and the live fight resolution.
+  var OUTCOME = {
+    long: {
+      teep: { guard: 'blocked', check: 'blocked', lean: 'clean', 'catch': 'caught', step: 'clean' },
+      body: { guard: 'blocked', check: 'blocked', lean: 'clean', 'catch': 'caught', step: 'evaded' },
+      head: { guard: 'blocked', check: 'clean', lean: 'countered', 'catch': 'clean', step: 'evaded' }
+    },
+    mid: {
+      punch: { guard: 'blocked', check: 'clean', lean: 'countered', 'catch': 'clean', step: 'clean' },
+      body: { guard: 'blocked', check: 'blocked', lean: 'clean', 'catch': 'caught', step: 'blocked' },
+      head: { guard: 'blocked', check: 'clean', lean: 'countered', 'catch': 'clean', step: 'evaded' },
+      low: { guard: 'clean', check: 'checked', lean: 'clean', 'catch': 'clean', step: 'blocked' }
+    },
+    close: {
+      elbow: { guard: 'blocked', check: 'clean', lean: 'countered', 'catch': 'clean', step: 'evaded' },
+      knee: { guard: 'blocked', check: 'checked', lean: 'clean', 'catch': 'clean', step: 'clean' }
+    }
+  };
+
+  // Judging value (points to the attacker; negative means the defender wins the exchange)
+  function cleanValue(atk) {
+    var t = TECH[atk];
+    return t.score + (t.dmg >= STAGGER_DMG ? STAGGER_POINTS : 0);
+  }
+  function typeValue(atk, type) {
+    var s = TECH[atk].score;
+    switch (type) {
+      case 'clean': return cleanValue(atk);
+      case 'blocked': return 0.4 * s;
+      case 'evaded': return -0.5;
+      case 'checked': return -(0.8 * s + 0.5);
+      case 'caught': return -(s + 1.5);
+      case 'countered': return -2.5;
+      default: return -0.5; // missed or jammed
+    }
+  }
+  function outcomeType(band, atk, def) {
+    if (def === 'none') return 'clean';
+    var row = OUTCOME[band] && OUTCOME[band][atk];
+    return row ? row[def] : 'missed';
+  }
+  function outcomeValue(band, atk, def) { return typeValue(atk, outcomeType(band, atk, def)); }
+  function attackValidIn(band, atk) { return !!(OUTCOME[band] && OUTCOME[band][atk]); }
+
+  /* ---------- Clinch: a posture tug-of-war, each beat a simultaneous move ---------- */
+  // Rows: your move, columns: opponent's move, value: judging points to you.
+  // Knee beats shifting weight (it lands), pulling the head beats a knee
+  // (you are on one leg), shifting weight beats a pull (you turn out of it).
+  var CLINCH_WIN = { cknee: cleanValue('knee'), pull: 2, shift: 2 };
+  var CLINCH_BEATS = { cknee: 'shift', pull: 'cknee', shift: 'pull' };
+  var CLINCH_FREE = { cknee: cleanValue('knee'), pull: 2, shift: 1 }; // against an opponent who did nothing
+  function clinchValue(me, opp) {
+    var meNone = !me || me === 'none', oppNone = !opp || opp === 'none';
+    if (meNone && oppNone) return 0;
+    if (oppNone) return CLINCH_FREE[me];
+    if (meNone) return -CLINCH_FREE[opp];
+    if (me === opp) return 0;
+    if (CLINCH_BEATS[me] === opp) return CLINCH_WIN[me];
+    return -CLINCH_WIN[opp];
+  }
+
+  /* ---------- Payoff matrices ---------- */
+  function buildMatrices() {
+    var M = {};
+    STRIKE_BANDS.forEach(function (b) {
+      var rows = BAND_ATTACKS[b];
+      M[b] = { rows: rows, cols: DEFENCES.slice(), A: rows.map(function (a) { return DEFENCES.map(function (d) { return outcomeValue(b, a, d); }); }) };
+    });
+    var cm = BAND_ATTACKS.clinch;
+    M.clinch = { rows: cm, cols: cm.slice(), A: cm.map(function (a) { return cm.map(function (o) { return clinchValue(a, o); }); }) };
+    return M;
+  }
+
+  // Sanity rules from the design: every attack is beaten by some defence,
+  // every defence loses to some attack.
+  function checkNoDominance(M) {
+    var problems = [];
+    BANDS.forEach(function (b) {
+      var m = M[b];
+      m.rows.forEach(function (r, i) {
+        if (!m.A[i].some(function (v) { return v < 0; })) problems.push(b + ': ' + r + ' is never beaten');
+      });
+      m.cols.forEach(function (c, j) {
+        if (!m.A.some(function (row) { return row[j] > 0; })) problems.push(b + ': ' + c + ' never loses');
+      });
+    });
+    return problems;
+  }
+
+  /* ---------- Fictitious play (Brown 1951, Robinson 1951) ---------- */
+  // Two imaginary players repeatedly best-respond to each other's empirical
+  // mix (alternating moves, as in Brown's original scheme). In a zero-sum game
+  // the empirical mixes converge to a Nash equilibrium. We iterate until the
+  // duality gap (what the attacker could get by best-responding to the
+  // defender's mix, minus what its own mix guarantees) is below tol.
+  function fictitiousPlay(A, opts) {
+    opts = opts || {};
+    var tol = opts.tol || 5e-4, maxIter = opts.maxIter || 2e7, check = 500;
+    var n = A.length, m = A[0].length, i, j;
+    var rowCount = new Float64Array(n), colCount = new Float64Array(m);
+    var rowPay = new Float64Array(n), colPay = new Float64Array(m);
+    var bi = 0, bj = 0, t = 0, gap = Infinity;
+    while (t < maxIter) {
+      rowCount[bi]++; t++;
+      for (j = 0; j < m; j++) colPay[j] += A[bi][j];
+      bj = 0; for (j = 1; j < m; j++) if (colPay[j] < colPay[bj]) bj = j;
+      colCount[bj]++;
+      for (i = 0; i < n; i++) rowPay[i] += A[i][bj];
+      bi = 0; for (i = 1; i < n; i++) if (rowPay[i] > rowPay[bi]) bi = i;
+      if (t % check === 0) {
+        gap = rowPay[bi] / t - colPay[bj] / t;
+        if (gap < tol) break;
+      }
+    }
+    var upper = rowPay[bi] / t, lower = colPay[bj] / t;
+    gap = upper - lower;
+    var rowMix = [], colMix = [];
+    for (i = 0; i < n; i++) rowMix.push(rowCount[i] / t);
+    for (j = 0; j < m; j++) colMix.push(colCount[j] / t);
+    return { rowMix: rowMix, colMix: colMix, value: (upper + lower) / 2, gap: gap, iterations: t, converged: gap < tol };
+  }
+
+  function computeEquilibria(M, opts) {
+    var eq = {};
+    BANDS.forEach(function (b) {
+      var r = fictitiousPlay(M[b].A, opts);
+      var att = {}, def = {};
+      M[b].rows.forEach(function (a, i) { att[a] = r.rowMix[i]; });
+      M[b].cols.forEach(function (d, j) { def[d] = r.colMix[j]; });
+      eq[b] = { attack: att, defence: def, value: r.value, gap: r.gap, iterations: r.iterations, converged: r.converged };
+    });
+    return eq;
+  }
+
+  function assertInterior(eq) {
+    var failures = [];
+    BANDS.forEach(function (b) {
+      Object.keys(eq[b].attack).forEach(function (a) {
+        var p = eq[b].attack[a];
+        if (!(p > 0 && p < 1)) failures.push(b + '/' + a + '=' + p);
+      });
+    });
+    return failures;
+  }
+
+  /* ---------- Best responses ---------- */
+  function bestDefence(band, q) {
+    var best = null, bestV = Infinity;
+    DEFENCES.forEach(function (d) {
+      var v = 0;
+      BAND_ATTACKS[band].forEach(function (a) { v += (q[a] || 0) * outcomeValue(band, a, d); });
+      if (v < bestV - 1e-9) { bestV = v; best = d; }
+    });
+    return best;
+  }
+  var DEF_SPACE = DEFENCES.concat(['none']);
+  function bestAttack(band, q) {
+    var best = null, bestV = -Infinity;
+    BAND_ATTACKS[band].forEach(function (a) {
+      var v = 0;
+      DEF_SPACE.forEach(function (d) { v += (q[d] || 0) * outcomeValue(band, a, d); });
+      if (v > bestV + 1e-9) { bestV = v; best = a; }
+    });
+    return best;
+  }
+  function bestClinch(q) {
+    var best = null, bestV = -Infinity;
+    BAND_ATTACKS.clinch.forEach(function (m) {
+      var v = 0;
+      BAND_ATTACKS.clinch.forEach(function (o) { v += (q[o] || 0) * clinchValue(m, o); });
+      if (v > bestV + 1e-9) { bestV = v; best = m; }
+    });
+    return best;
+  }
+
+  /* ---------- Learning the player's habits ---------- */
+  // Recency-weighted counts conditioned on (range band, previous action),
+  // backed off to the band-only counts, with a uniform prior on top.
+  function kindOf(action) {
+    if (action === 'cknee' || action === 'pull' || action === 'shift') return 'cl';
+    if (DEF_SPACE.indexOf(action) >= 0) return 'def';
+    return 'atk';
+  }
+  function Predictor(params) {
+    params = params || {};
+    this.lambda = params.lambda != null ? params.lambda : 0.86;
+    this.alpha = params.alpha != null ? params.alpha : 0.4;
+    this.kappa = params.kappa != null ? params.kappa : 1.5;
+    this.counts = {};
+  }
+  Predictor.prototype._bump = function (key, action) {
+    var t = this.counts[key] || (this.counts[key] = {});
+    var k = kindOf(action), lam = this.lambda;
+    Object.keys(t).forEach(function (a) { if (kindOf(a) === k) t[a] *= lam; });
+    t[action] = (t[action] || 0) + 1;
+  };
+  Predictor.prototype.observe = function (band, prev, action) {
+    if (BANDS.indexOf(band) < 0 || !action) return;
+    this._bump(band + '|*', action);
+    this._bump(band + '|' + prev, action);
+  };
+  Predictor.prototype.predict = function (band, prev, set) {
+    var B = this.counts[band + '|*'] || {}, C = this.counts[band + '|' + prev] || {};
+    var wb = 0, wc = 0, n = set.length, a, i, out = {};
+    for (i = 0; i < n; i++) { a = set[i]; wb += B[a] || 0; wc += C[a] || 0; }
+    for (i = 0; i < n; i++) {
+      a = set[i];
+      var pb = ((B[a] || 0) + this.alpha) / (wb + this.alpha * n);
+      out[a] = ((C[a] || 0) + this.kappa * pb) / (wc + this.kappa);
+    }
+    return out;
+  };
+  function argmaxKey(q, set) {
+    var best = set[0];
+    for (var i = 1; i < set.length; i++) if (q[set[i]] > q[best]) best = set[i];
+    return best;
+  }
+  // 0 when the prediction is uniform, 1 when it is certain
+  function confidence(q, set) {
+    var n = set.length, mx = q[argmaxKey(q, set)];
+    return clamp((mx - 1 / n) / (1 - 1 / n), 0, 1);
+  }
+
+  /* ---------- Opponent styles ---------- */
+  // Ladder, easiest first. learn: the per-opponent learning factor.
+  // strength: how far the style mix leans away from the equilibrium mix.
+  var OPPONENTS = [
+    { id: 'dejrit', name: 'Dejrit Kor Sangthong', nick: 'The Hammer', gym: 'Kor Sangthong Gym', style: 'Heavy puncher',
+      line: 'Walks you down behind a high guard and swings heavy hands and elbows.',
+      learn: 0.8, strength: 0.45, aggression: 0.85, prefer: 'mid', clinch: 0.08, skin: 0.5,
+      attackFav: { punch: 5, elbow: 3, low: 1.5, body: 0.8, head: 0.4, teep: 0.5, knee: 1, cknee: 1, pull: 1, shift: 1 },
+      defenceFav: { guard: 4, check: 1, lean: 0.4, 'catch': 0.4, step: 1 } },
+    { id: 'lamnam', name: 'Lamnam Sit Nonglek', nick: 'The Whip', gym: 'Sit Nonglek Gym', style: 'Kicker',
+      line: 'Long and loose, fires body and head kicks from range and checks everything.',
+      learn: 0.82, strength: 0.4, aggression: 0.9, prefer: 'long', clinch: 0.05, skin: 0.65,
+      attackFav: { punch: 0.6, elbow: 0.6, low: 2.5, body: 3.5, head: 3, teep: 2.5, knee: 1, cknee: 1, pull: 1, shift: 1 },
+      defenceFav: { guard: 1, check: 3, lean: 1.5, 'catch': 0.6, step: 2 } },
+    { id: 'kraisorn', name: 'Kraisorn Por Wanchai', nick: 'Iron Collar', gym: 'Por Wanchai Camp', style: 'Knee and clinch specialist',
+      line: 'Grabs the neck at every chance and drowns you in knees.',
+      learn: 0.85, strength: 0.45, aggression: 0.95, prefer: 'close', clinch: 0.45, skin: 0.4,
+      attackFav: { punch: 0.8, elbow: 1, low: 0.8, body: 1, head: 0.4, teep: 2, knee: 5, cknee: 3, pull: 2, shift: 1 },
+      defenceFav: { guard: 2, check: 2.5, lean: 0.6, 'catch': 1.5, step: 0.5 } },
+    { id: 'wanchalerm', name: 'Wanchalerm Petchsamut', nick: 'The Razor', gym: 'Petchsamut Gym', style: 'Elbow specialist',
+      line: 'Slips inside your kicks to cut you with elbows from every angle.',
+      learn: 0.88, strength: 0.4, aggression: 1.0, prefer: 'close', clinch: 0.15, skin: 0.55,
+      attackFav: { punch: 2, elbow: 6, low: 1, body: 0.8, head: 0.5, teep: 0.6, knee: 1.5, cknee: 1, pull: 1.5, shift: 1 },
+      defenceFav: { guard: 2, check: 1, lean: 2.5, 'catch': 1, step: 1 } },
+    { id: 'nattapong', name: 'Nattapong Sitchanthep', nick: 'The Mirror', gym: 'Sitchanthep Gym', style: 'Technical counter-striker',
+      line: 'Patient and slippery. Leans, catches and makes you pay for every miss.',
+      learn: 0.92, strength: 0.35, aggression: 0.95, prefer: 'mid', clinch: 0.08, skin: 0.6,
+      attackFav: { punch: 1.5, elbow: 1, low: 2, body: 1, head: 1, teep: 2.5, knee: 1, cknee: 1, pull: 1, shift: 1.5 },
+      defenceFav: { guard: 0.6, check: 1.5, lean: 3, 'catch': 3, step: 1 } },
+    { id: 'thanakorn', name: 'Thanakorn Lukmaenam', nick: 'The Professor', gym: 'Lukmaenam Gym', style: 'Champion',
+      line: 'No favourite weapon and no habits. Learns your patterns faster than anyone.',
+      learn: 1.0, strength: 0, aggression: 1.1, prefer: 'mid', clinch: 0.15, skin: 0.45,
+      attackFav: {}, defenceFav: {} }
+  ];
+  var DIVISION_EXTRA = [
+    { id: 'boonlert', name: 'Boonlert Sor Rattanachai', gym: 'Sor Rattanachai Gym' },
+    { id: 'chatri', name: 'Chatri Kiatnakorn', gym: 'Kiatnakorn Gym' },
+    { id: 'ekachai', name: 'Ekachai Wor Saengtong', gym: 'Wor Saengtong Camp' },
+    { id: 'kittisak', name: 'Kittisak Sor Phanthong', gym: 'Sor Phanthong Gym' },
+    { id: 'surasak', name: 'Surasak Lukthapra', gym: 'Lukthapra Gym' },
+    { id: 'yodchai', name: 'Yodchai Kiatsuwan', gym: 'Kiatsuwan Gym' }
+  ];
+  function newDivision(rng) {
+    var fighters = OPPONENTS.map(function (o) { return { id: o.id, name: o.name, gym: o.gym }; })
+      .concat(DIVISION_EXTRA.map(function (o) { return { id: o.id, name: o.name, gym: o.gym }; }));
+    fighters.forEach(function (f) { f.cut = 0.005 + rng() * 0.035; f.skill = 1 + 0.05 * gauss(rng); f.wins = 0; f.losses = 0; });
+    var div = { fighters: fighters, history: [] };
+    div.history.push(divisionAverage(div));
+    return div;
+  }
+
+  function styleMixes(eq, style) {
+    // A style is the equilibrium mix tilted towards the fighter's favourite tools.
+    var s = style.strength, out = { attack: {}, defence: {} };
+    BANDS.forEach(function (b) {
+      var acts = BAND_ATTACKS[b];
+      var fav = {}, tot = 0;
+      acts.forEach(function (a) { fav[a] = (style.attackFav[a] != null ? style.attackFav[a] : 1); tot += fav[a]; });
+      var mix = {};
+      acts.forEach(function (a) { mix[a] = (1 - s) * eq[b].attack[a] + s * fav[a] / tot; });
+      out.attack[b] = mix;
+      if (b !== 'clinch') {
+        var dfav = {}, dt = 0, dm = {};
+        DEFENCES.forEach(function (d) { dfav[d] = (style.defenceFav[d] != null ? style.defenceFav[d] : 1); dt += dfav[d]; });
+        DEFENCES.forEach(function (d) { dm[d] = (1 - s) * eq[b].defence[d] + s * dfav[d] / dt; });
+        out.defence[b] = dm;
+      }
+    });
+    return out;
+  }
+
+  // One AI decision. kind: 'defend' (player is attacking), 'attack' or 'clinch'.
+  // With probability confidence x learning factor the AI best-responds to its
+  // prediction of the player's move; otherwise it plays its own style's mix.
+  function decide(kind, predictor, band, prev, mixes, learnFactor, rng) {
+    var set, br, styleMix, styleKeys;
+    if (kind === 'defend') { set = BAND_ATTACKS[band]; styleMix = mixes.defence[band]; styleKeys = DEFENCES; }
+    else if (kind === 'attack') { set = DEF_SPACE; styleMix = mixes.attack[band]; styleKeys = BAND_ATTACKS[band]; }
+    else { set = BAND_ATTACKS.clinch; styleMix = mixes.attack.clinch; styleKeys = BAND_ATTACKS.clinch; band = 'clinch'; }
+    var q = predictor.predict(band, prev, set);
+    var conf = confidence(q, set);
+    var predicted = argmaxKey(q, set);
+    var pRead = conf * learnFactor;
+    var action, mode;
+    if (rng() < pRead) {
+      action = kind === 'defend' ? bestDefence(band, q) : kind === 'attack' ? bestAttack(band, q) : bestClinch(q);
+      mode = 'read';
+    } else {
+      action = sampleMix(styleMix, styleKeys, rng);
+      mode = 'style';
+    }
+    return { action: action, mode: mode, predicted: predicted, confidence: conf, pRead: pRead, q: q };
+  }
+
+  /* ---------- Weight cut ---------- */
+  var CUT_MAX = 0.10;
+  var CUT = { power: 0.8, reach: 30, cap: 0.25, recovery: 0.35 };
+  function cutModifiers(cutSelf, cutOpp) {
+    var adv = Math.max(0, cutSelf - cutOpp) / CUT_MAX;   // size edge on fight night, for whoever cut more
+    var q = (cutSelf / CUT_MAX) * (cutSelf / CUT_MAX);   // own cost grows with the square of the cut
+    return {
+      power: 1 + CUT.power * adv,
+      reach: CUT.reach * adv,
+      staminaCap: 1 - CUT.cap * q,
+      recovery: 1 - CUT.recovery * q
+    };
+  }
+
+  // Off-screen bout using the same matrices, equilibrium mixes and cut model.
+  // One tick is one second of a 5 x 45 s fight.
+  var SIM = { attackRate: 0.5, fatigueAttack: 0.2, fail: 1.0, dmg: 0.13, regen: 9, betweenRounds: 40 };
+  // A tired fighter cannot brace: incoming damage grows as stamina falls (used in the live fight too)
+  var ABSORB = { k: 0.6 };
+  function absorbFactor(stamina) { var tired = clamp(1 - stamina / 100, 0, 1); return 1 + ABSORB.k * tired; }
+  var SIM_BANDS = { long: 0.3, mid: 0.4, close: 0.18, clinch: 0.12 };
+  function simulateBout(A, B, eq, rng) {
+    var mA = cutModifiers(A.cut, B.cut), mB = cutModifiers(B.cut, A.cut);
+    function mk(f, m) {
+      return { hp: 100, cap: 100 * m.staminaCap, st: 100 * m.staminaCap, rec: m.recovery, pow: m.power * (f.skill || 1), reach: m.reach, pts: 0, taken: 0 };
+    }
+    var F = [mk(A, mA), mk(B, mB)];
+    var cards = [0, 0], ko = -1, round = 0;
+    for (round = 0; round < 5 && ko < 0; round++) {
+      F[0].pts = F[1].pts = 0;
+      for (var tick = 0; tick < 45 && ko < 0; tick++) {
+        var first = rng() < 0.5 ? 0 : 1;
+        for (var o = 0; o < 2 && ko < 0; o++) {
+          var k = o === 0 ? first : 1 - first, a = F[k], d = F[1 - k];
+          var fresh = a.st / 100;
+          if (a.st > 4 && rng() < SIM.attackRate * (1 - SIM.fatigueAttack * (1 - fresh))) {
+            var r = rng(), band = 'long', acc = 0;
+            for (var bi = 0; bi < BANDS.length; bi++) { acc += SIM_BANDS[BANDS[bi]]; if (r < acc) { band = BANDS[bi]; break; } }
+            var v, dmg = 0, cost;
+            if (band === 'clinch') {
+              var mv = sampleMix(eq.clinch.attack, BAND_ATTACKS.clinch, rng);
+              var ov = sampleMix(eq.clinch.attack, BAND_ATTACKS.clinch, rng);
+              v = clinchValue(mv, ov);
+              cost = 5;
+              if ((v > 0 && mv === 'cknee') || (v < 0 && ov === 'cknee')) dmg = TECH.knee.dmg;
+            } else {
+              var atk = sampleMix(eq[band].attack, BAND_ATTACKS[band], rng);
+              var def = sampleMix(eq[band].defence, DEFENCES, rng);
+              // a tired defender is late, so the technique lands clean
+              var tired = 1 - d.st / 100;
+              if (rng() < SIM.fail * tired * tired) def = 'none';
+              var type = outcomeType(band, atk, def);
+              // longer reach: the opponent cannot quite get out of range
+              if (type === 'evaded' && rng() < a.reach / 45) type = 'blocked';
+              v = typeValue(atk, type);
+              cost = TECH[atk].cost;
+              if (type === 'clean') dmg = TECH[atk].dmg;
+              else if (type === 'blocked') dmg = TECH[atk].dmg * 0.25;
+              else if (v < 0 && type !== 'evaded') dmg = -v * 1.3;
+            }
+            a.st = Math.max(0, a.st - cost);
+            dmg *= SIM.dmg;
+            var hurt;
+            if (v > 0) { hurt = dmg * a.pow * absorbFactor(d.st); d.hp -= hurt; d.taken += hurt; a.pts += v * a.pow; }
+            else if (v < 0) { hurt = dmg * d.pow * absorbFactor(a.st); a.hp -= hurt; a.taken += hurt; d.pts += -v; }
+            if (d.hp <= 0) ko = k; else if (a.hp <= 0) ko = 1 - k;
+          } else {
+            a.st = Math.min(a.cap, a.st + SIM.regen * a.rec);
+          }
+        }
+      }
+      if (ko < 0) {
+        if (F[0].pts > F[1].pts + 0.5) cards[0]++; else if (F[1].pts > F[0].pts + 0.5) cards[1]++;
+        for (var q = 0; q < 2; q++) { F[q].hp = Math.min(100, F[q].hp + 8 * F[q].rec); F[q].st = Math.min(F[q].cap, F[q].st + SIM.betweenRounds * F[q].rec); }
+      }
+    }
+    var winner;
+    if (ko >= 0) winner = ko;
+    else if (cards[0] !== cards[1]) winner = cards[0] > cards[1] ? 0 : 1;
+    else winner = rng() < 0.5 ? 0 : 1;
+    return { winner: winner, ko: ko >= 0, taken: [F[0].taken, F[1].taken], rounds: round };
+  }
+
+  // A fighter's payoff from a bout: winning, minus the health cost of the damage absorbed.
+  var PAYOFF = { health: 1.0 };
+  function boutPayoff(res, who) { return (res.winner === who ? 1 : 0) - PAYOFF.health * res.taken[who] / 100; }
+
+  function expectedPayoffs(cutA, cutB, eq, n, seed) {
+    var rng = makeRng(seed || 7), su = 0, su2 = 0, wins = 0, taken = 0, kos = 0;
+    for (var i = 0; i < n; i++) {
+      var r = simulateBout({ cut: cutA, skill: 1 }, { cut: cutB, skill: 1 }, eq, rng);
+      var u = boutPayoff(r, 0);
+      if (r.ko) kos++;
+      su += u; su2 += u * u; if (r.winner === 0) wins++; taken += r.taken[0];
+    }
+    var mean = su / n;
+    return { payoff: mean, se: Math.sqrt(Math.max(0, su2 / n - mean * mean) / n), winRate: wins / n, damageTaken: taken / n, koRate: kos / n };
+  }
+
+  /* ---------- Division of 12 AI fighters ---------- */
+  function divisionAverage(div) {
+    var s = 0; div.fighters.forEach(function (f) { s += f.cut; }); return s / div.fighters.length;
+  }
+  // Pair everyone off, simulate, then losers imitate the winner's cut (with noise).
+  function divisionStep(div, eq, rng, extra) {
+    var ids = div.fighters.map(function (_, i) { return i; });
+    for (var pass = 0; pass < 2; pass++) {
+      for (var i = ids.length - 1; i > 0; i--) { var j = Math.floor(rng() * (i + 1)); var t = ids[i]; ids[i] = ids[j]; ids[j] = t; }
+      var results = [];
+      for (var p = 0; p + 1 < ids.length; p += 2) {
+        var a = div.fighters[ids[p]], b = div.fighters[ids[p + 1]];
+        var r = simulateBout(a, b, eq, rng);
+        var w = r.winner === 0 ? a : b, l = r.winner === 0 ? b : a;
+        w.wins = (w.wins || 0) + 1; l.losses = (l.losses || 0) + 1;
+        results.push({ winner: w, loser: l });
+      }
+      if (extra && pass === 0) results.push(extra);
+      results.forEach(function (res) {
+        if (res.loser && res.loser.ai !== false) res.loser.cut = clamp(res.winner.cut + 0.004 * gauss(rng), 0, CUT_MAX);
+        if (res.winner && res.winner.ai !== false) res.winner.cut = clamp(res.winner.cut + 0.002 * gauss(rng), 0, CUT_MAX);
+      });
+    }
+    div.history.push(divisionAverage(div));
+    return div;
+  }
+
+  /* ---------- Judging ---------- */
+  function judgeRound(ptsP, ptsO, kdP, kdO, rng) {
+    var cards = [];
+    for (var j = 0; j < 3; j++) {
+      var p = ptsP * (1 + 0.08 * gauss(rng)), o = ptsO * (1 + 0.08 * gauss(rng));
+      var diff = p - o, card;
+      if (Math.abs(diff) < 0.6 && !kdP && !kdO) card = [10, 10];
+      else if (diff > 0) card = [10, (diff > 14 || kdO) ? 8 : 9];
+      else card = [(diff < -14 || kdP) ? 8 : 9, 10];
+      cards.push(card);
+    }
+    return cards;
+  }
+
+  /* ---------- Analysis ---------- */
+  function entropyBits(counts) {
+    var tot = 0, h = 0;
+    Object.keys(counts).forEach(function (k) { tot += counts[k]; });
+    if (!tot) return 0;
+    Object.keys(counts).forEach(function (k) { var p = counts[k] / tot; if (p > 0) h -= p * Math.log2(p); });
+    return h;
+  }
+  function analyseFight(exchanges, eq) {
+    var freq = {}, totals = {};
+    BANDS.forEach(function (b) { freq[b] = {}; totals[b] = 0; BAND_ATTACKS[b].forEach(function (a) { freq[b][a] = 0; }); });
+    var acc = [], hits = 0, n = 0, reads = 0;
+    exchanges.forEach(function (x) {
+      var isPlayerChoice = (x.initiator === 'player' || x.initiator === 'clinch');
+      if (isPlayerChoice && freq[x.band] && freq[x.band][x.playerAction] != null) { freq[x.band][x.playerAction]++; totals[x.band]++; }
+      if (x.aiPrediction && x.playerAction && BANDS.indexOf(x.band) >= 0) {
+        n++; if (x.aiPrediction === x.playerAction) hits++;
+        acc.push({ i: n, correct: x.aiPrediction === x.playerAction, t: x.t });
+      }
+      if (x.read) reads++;
+    });
+    var hSum = 0, hMaxSum = 0;
+    BANDS.forEach(function (b) {
+      if (totals[b] < 2) return;
+      hSum += totals[b] * entropyBits(freq[b]);
+      hMaxSum += totals[b] * Math.log2(BAND_ATTACKS[b].length);
+    });
+    var predictability = hMaxSum > 0 ? Math.round(100 * (1 - hSum / hMaxSum)) : null;
+    var rolling = [];
+    for (var i = 0; i < acc.length; i++) {
+      var lo = Math.max(0, i - 9), c = 0;
+      for (var k = lo; k <= i; k++) if (acc[k].correct) c++;
+      rolling.push(c / (i - lo + 1));
+    }
+    var mixes = {};
+    BANDS.forEach(function (b) {
+      mixes[b] = {};
+      BAND_ATTACKS[b].forEach(function (a) { mixes[b][a] = { player: totals[b] ? freq[b][a] / totals[b] : 0, equilibrium: eq[b].attack[a] }; });
+    });
+    return {
+      counts: freq, totals: totals, mixes: mixes,
+      predictionAccuracy: n ? hits / n : null, predictions: n, rollingAccuracy: rolling,
+      entropyBits: hMaxSum > 0 ? hSum / Object.keys(totals).reduce(function (s, b) { return s + (totals[b] >= 2 ? totals[b] : 0); }, 0) : null,
+      predictability: predictability, reads: reads
+    };
+  }
+
+  return {
+    makeRng: makeRng, gauss: gauss, sampleMix: sampleMix, clamp: clamp,
+    TECH: TECH, RANGE: RANGE, bandOf: bandOf, BANDS: BANDS, STRIKE_BANDS: STRIKE_BANDS, DEFENCES: DEFENCES, DEF_SPACE: DEF_SPACE,
+    BAND_ATTACKS: BAND_ATTACKS, LABEL: LABEL, OUTCOME: OUTCOME, STAGGER_DMG: STAGGER_DMG,
+    cleanValue: cleanValue, typeValue: typeValue, outcomeType: outcomeType, outcomeValue: outcomeValue, attackValidIn: attackValidIn,
+    clinchValue: clinchValue, CLINCH_BEATS: CLINCH_BEATS,
+    buildMatrices: buildMatrices, checkNoDominance: checkNoDominance, fictitiousPlay: fictitiousPlay,
+    computeEquilibria: computeEquilibria, assertInterior: assertInterior,
+    bestDefence: bestDefence, bestAttack: bestAttack, bestClinch: bestClinch,
+    Predictor: Predictor, confidence: confidence, argmaxKey: argmaxKey, styleMixes: styleMixes, decide: decide,
+    CUT_MAX: CUT_MAX, CUT: CUT, SIM: SIM, ABSORB: ABSORB, PAYOFF: PAYOFF, absorbFactor: absorbFactor, cutModifiers: cutModifiers, simulateBout: simulateBout, boutPayoff: boutPayoff, expectedPayoffs: expectedPayoffs,
+    OPPONENTS: OPPONENTS, DIVISION_EXTRA: DIVISION_EXTRA, newDivision: newDivision,
+    divisionAverage: divisionAverage, divisionStep: divisionStep, judgeRound: judgeRound,
+    entropyBits: entropyBits, analyseFight: analyseFight
+  };
+})();
+if (typeof module !== 'undefined' && module.exports) module.exports = EL;
+</script>
+<script id="game-layer">
+/* ==========================================================================
+   GAME LAYER: rendering, input, audio, fight flow. Uses EL for every rule.
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  var W = 1280, H = 720, GROUND = 600;
+  var X_MIN = 200, X_MAX = 1080, MIN_GAP = 62, CLINCH_GAP = 96;
+  var DMG_SCALE = 0.11;
+  var ROUND_TIME = 45, ROUNDS = 5;
+  var STEP = 1 / 120;
+  var TECH = EL.TECH;
+  var LABEL = EL.LABEL;
+
+  /* ---------- Startup: solve each band's game by fictitious play ---------- */
+  var MATRICES = EL.buildMatrices();
+  var EQ = (function () {
+    var t0 = (window.performance && performance.now) ? performance.now() : Date.now();
+    var eq = EL.computeEquilibria(MATRICES);
+    var ms = ((window.performance && performance.now) ? performance.now() : Date.now()) - t0;
+    console.log('Eight Limbs: equilibrium attack mix per range band, solved by fictitious play in ' + ms.toFixed(0) + ' ms');
+    EL.BANDS.forEach(function (b) {
+      var row = {};
+      Object.keys(eq[b].attack).forEach(function (a) { row[LABEL[a]] = +eq[b].attack[a].toFixed(4); });
+      console.log('  ' + b + ': ' + JSON.stringify(row) + '  value ' + eq[b].value.toFixed(3) +
+        ', duality gap ' + eq[b].gap.toExponential(2) + ', ' + eq[b].iterations + ' iterations');
+      Object.keys(eq[b].attack).forEach(function (a) {
+        var p = eq[b].attack[a];
+        console.assert(p > 0 && p < 1, 'Equilibrium probability not strictly between 0 and 1: ' + b + '/' + a + ' = ' + p);
+        console.assert(p > 0.01, 'Equilibrium probability only trivially above 0: ' + b + '/' + a + ' = ' + p);
+      });
+      console.assert(eq[b].converged, 'Fictitious play did not converge for ' + b);
+    });
+    var problems = EL.checkNoDominance(MATRICES);
+    console.assert(problems.length === 0, 'Dominance problems: ' + problems.join('; '));
+    return eq;
+  })();
+
+  /* ---------- Canvas ---------- */
+  var cv = document.getElementById('game');
+  var ctx = cv.getContext('2d');
+  var DPR = 1, VS = 1, VX = 0, VY = 0;
+  var bgCanvas = null;
+  function resize() {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    var w = window.innerWidth, h = window.innerHeight;
+    cv.width = Math.max(1, Math.round(w * DPR)); cv.height = Math.max(1, Math.round(h * DPR));
+    cv.style.width = w + 'px'; cv.style.height = h + 'px';
+    VS = Math.min(w / W, h / H); VX = (w - W * VS) / 2; VY = (h - H * VS) / 2;
+    bgCanvas = null;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+  function baseTransform() { ctx.setTransform(DPR * VS, 0, 0, DPR * VS, DPR * VX, DPR * VY); }
+
+  /* ---------- Small helpers ---------- */
+  var clamp = EL.clamp;
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function easeOut(t) { t = clamp(t, 0, 1); return 1 - (1 - t) * (1 - t); }
+  function easeInOut(t) { t = clamp(t, 0, 1); return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; }
+  function rand(a, b) { return a + (b - a) * Math.random(); }
+  function approach(v, target, rate) { return v < target ? Math.min(target, v + rate) : Math.max(target, v - rate); }
+  function pct(v, d) { return (v * 100).toFixed(d == null ? 1 : d) + '%'; }
+  var FONT = '"Trebuchet MS", "Segoe UI", Helvetica, Arial, sans-serif';
+  var FONT_BOLD = '"Arial Black", "Arial Bold", Impact, ' + FONT;
+  function font(size, bold) { return (bold ? '700 ' : '400 ') + size + 'px ' + (bold === 2 ? FONT_BOLD : FONT); }
+  function spaced(px) { try { ctx.letterSpacing = px + 'px'; } catch (e) { /* unsupported */ } }
+  var COL = {
+    text: '#f3ece0', dim: '#a89f92', faint: '#6d665d', amber: '#f2a93b', gold: '#ffd27a',
+    blue: '#4f8fff', blueDeep: '#1f4fd1', red: '#ff4d42', redDeep: '#c42a22', cyan: '#8ff5ff', panel: 'rgba(14,11,9,0.86)'
+  };
+
+  /* ---------- Save and load (localStorage, never fatal) ---------- */
+  var SAVE_KEY = 'eightLimbs.save.v1';
+  var storage = (function () {
+    var ls = null;
+    try { ls = window.localStorage; var k = '__el_probe'; ls.setItem(k, '1'); ls.removeItem(k); } catch (e) { ls = null; }
+    function trim(data) {
+      // Keep summaries, drop detailed exchange logs from the oldest fights first.
+      for (var i = 0; i < data.fights.length - 1; i++) {
+        if (data.fights[i].exchanges && data.fights[i].exchanges.length) { data.fights[i].exchanges = []; data.fights[i].exchangesTrimmed = true; return true; }
+      }
+      return false;
+    }
+    return {
+      available: !!ls,
+      load: function () {
+        if (!ls) return null;
+        try { var s = ls.getItem(SAVE_KEY); return s ? JSON.parse(s) : null; } catch (e) { return null; }
+      },
+      save: function (data) {
+        if (!ls) return false;
+        for (var attempt = 0; attempt < 40; attempt++) {
+          try { ls.setItem(SAVE_KEY, JSON.stringify(data)); return true; } catch (e) { if (!trim(data)) return false; }
+        }
+        return false;
+      }
+    };
+  })();
+
+  function newCareer() {
+    var seed = (Date.now() ^ Math.floor(Math.random() * 1e9)) >>> 0;
+    var rng = EL.makeRng(seed);
+    return {
+      version: 1, created: new Date().toISOString(), rung: 0, complete: false,
+      record: { wins: 0, losses: 0, kos: 0 }, division: EL.newDivision(rng), fights: [], seed: seed
+    };
+  }
+  function validCareer(c) {
+    return c && c.version === 1 && c.division && Array.isArray(c.division.fighters) && c.division.fighters.length === 12 &&
+      Array.isArray(c.division.history) && Array.isArray(c.fights) && c.record && typeof c.rung === 'number';
+  }
+  var career = storage.load();
+  if (!validCareer(career)) career = null;
+  var gameRng = EL.makeRng((Date.now() * 7919) >>> 0);
+  function saveCareer() { if (career) storage.save(career); }
+
+  /* ---------- Audio (Web Audio, all synthesised) ---------- */
+  var Sound = (function () {
+    var ac = null, master, sfx, music, crowdGain, noise, crowdBp;
+    var crowdLevel = 0.05, crowdTarget = 0.05, crowdBase = 0.05;
+    var nextStep = 0, step = 0, musicVol = 0.25, playing = false;
+    var api = { intensity: 0, tempo: 100, ready: false };
+    function gain(v, to) { var g = ac.createGain(); g.gain.value = v; g.connect(to); return g; }
+    api.init = function () {
+      if (ac) { if (ac.state === 'suspended' && ac.resume) ac.resume(); return; }
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      try { ac = new AC(); } catch (e) { ac = null; return; }
+      master = ac.createGain(); master.gain.value = 0.75;
+      var comp = ac.createDynamicsCompressor();
+      comp.threshold.value = -14; comp.ratio.value = 4;
+      master.connect(comp); comp.connect(ac.destination);
+      sfx = gain(0.9, master); music = gain(musicVol, master); crowdGain = gain(0, master);
+      noise = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate);
+      var d = noise.getChannelData(0);
+      for (var i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+      // crowd bed: filtered noise with a slow murmur
+      var src = ac.createBufferSource(); src.buffer = noise; src.loop = true;
+      crowdBp = ac.createBiquadFilter(); crowdBp.type = 'bandpass'; crowdBp.frequency.value = 650; crowdBp.Q.value = 0.7;
+      var lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1800;
+      var lfo = ac.createOscillator(), lfoG = ac.createGain();
+      lfo.frequency.value = 0.23; lfoG.gain.value = 140; lfo.connect(lfoG); lfoG.connect(crowdBp.frequency); lfo.start();
+      src.connect(crowdBp); crowdBp.connect(lp); lp.connect(crowdGain); src.start();
+      nextStep = ac.currentTime + 0.1;
+      api.ready = true;
+    };
+    function env(g, t, peak, attack, decay) {
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + attack);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + attack + decay);
+    }
+    function burst(t, dur, type, freq, vol, q, out) {
+      var s = ac.createBufferSource(); s.buffer = noise;
+      var f = ac.createBiquadFilter(); f.type = type; f.frequency.value = freq; if (q) f.Q.value = q;
+      var g = ac.createGain(); env(g, t, vol, 0.002, dur);
+      s.connect(f); f.connect(g); g.connect(out || sfx);
+      var off = Math.random() * 1.5;
+      s.start(t, off, dur + 0.05);
+    }
+    function tone(t, type, f0, f1, dur, vol, out) {
+      var o = ac.createOscillator(), g = ac.createGain();
+      o.type = type; o.frequency.setValueAtTime(f0, t);
+      if (f1) o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+      env(g, t, vol, 0.004, dur);
+      o.connect(g); g.connect(out || sfx); o.start(t); o.stop(t + dur + 0.05);
+    }
+    api.thud = function (power) {
+      if (!ac) return; var t = ac.currentTime; power = clamp(power, 0.15, 1.4);
+      tone(t, 'sine', 150, 42, 0.18 + 0.08 * power, 0.75 * power);
+      burst(t, 0.07 + 0.03 * power, 'lowpass', 1100, 0.55 * power);
+    };
+    api.slap = function (power) {
+      if (!ac) return; var t = ac.currentTime; power = clamp(power, 0.15, 1.4);
+      burst(t, 0.045, 'bandpass', 2400, 0.9 * power, 0.8);
+      burst(t, 0.03, 'highpass', 4200, 0.35 * power);
+      tone(t, 'sine', 120, 50, 0.14, 0.45 * power);
+    };
+    api.block = function (power) {
+      if (!ac) return; var t = ac.currentTime;
+      burst(t, 0.06, 'lowpass', 650, 0.5 * power);
+      tone(t, 'triangle', 210, 120, 0.07, 0.18 * power);
+    };
+    api.crack = function () {
+      if (!ac) return; var t = ac.currentTime;
+      burst(t, 0.03, 'highpass', 2000, 0.8);
+      tone(t, 'square', 320, 90, 0.08, 0.15);
+      tone(t, 'sine', 160, 50, 0.2, 0.6);
+    };
+    api.whoosh = function (power) {
+      if (!ac) return; var t = ac.currentTime;
+      var s = ac.createBufferSource(); s.buffer = noise;
+      var f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.4;
+      f.frequency.setValueAtTime(500, t); f.frequency.exponentialRampToValueAtTime(1800, t + 0.16);
+      var g = ac.createGain(); env(g, t, 0.12 * power, 0.05, 0.14);
+      s.connect(f); f.connect(g); g.connect(sfx); s.start(t, Math.random(), 0.3);
+    };
+    api.breath = function () {
+      if (!ac) return; var t = ac.currentTime;
+      burst(t, 0.09, 'bandpass', 3200, 0.07, 1.2);
+    };
+    api.floor = function () {
+      if (!ac) return; var t = ac.currentTime;
+      tone(t, 'sine', 90, 35, 0.35, 1.0);
+      burst(t, 0.15, 'lowpass', 400, 0.7);
+    };
+    api.bell = function (times) {
+      if (!ac) return; var t0 = ac.currentTime;
+      for (var k = 0; k < (times || 1); k++) {
+        var t = t0 + k * 0.28;
+        [[640, 0.32], [1290, 0.16], [1710, 0.12], [2310, 0.07]].forEach(function (p) { tone(t, 'sine', p[0], 0, 1.4, p[1]); });
+      }
+    };
+    function ching(t, open) {
+      var vol = open ? 0.16 : 0.12, dur = open ? 0.38 : 0.05;
+      [2870, 3740, 4810, 6130].forEach(function (f, i) { tone(t, 'sine', f, 0, dur * (1 - i * 0.12), vol / (1 + i * 0.5), music); });
+      burst(t, open ? 0.12 : 0.03, 'highpass', 6000, open ? 0.07 : 0.1, 0, music);
+    }
+    function drum(t, low) {
+      if (low) { tone(t, 'sine', 95, 58, 0.26, 0.55, music); burst(t, 0.04, 'lowpass', 500, 0.25, 0, music); }
+      else { tone(t, 'sine', 215, 160, 0.12, 0.3, music); burst(t, 0.05, 'bandpass', 1300, 0.28, 1.1, music); }
+    }
+    api.oi = function () {
+      if (!ac) return; var t = ac.currentTime;
+      var f1 = ac.createBiquadFilter(); f1.type = 'bandpass'; f1.Q.value = 5;
+      f1.frequency.setValueAtTime(520, t); f1.frequency.linearRampToValueAtTime(320, t + 0.35);
+      var f2 = ac.createBiquadFilter(); f2.type = 'bandpass'; f2.Q.value = 6;
+      f2.frequency.setValueAtTime(900, t); f2.frequency.linearRampToValueAtTime(2200, t + 0.35);
+      var g = ac.createGain(); env(g, t, 0.2, 0.05, 0.4);
+      f1.connect(g); f2.connect(g); g.connect(sfx);
+      for (var i = 0; i < 7; i++) {
+        var o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.value = 150 + Math.random() * 90;
+        o.connect(f1); o.connect(f2); o.start(t + Math.random() * 0.04); o.stop(t + 0.5);
+      }
+    };
+    api.swell = function (amount) { crowdTarget = Math.min(0.75, crowdTarget + amount); };
+    api.setMusic = function (on, vol) { playing = on; musicVol = vol; if (music && ac) music.gain.setTargetAtTime(on ? vol : 0.0001, ac.currentTime, 0.3); };
+    api.update = function (dt) {
+      if (!ac) return;
+      api.intensity = Math.max(0, api.intensity - dt * 0.05);
+      crowdTarget = approach(crowdTarget, crowdBase + 0.06 * api.intensity, dt * 0.18);
+      crowdLevel = approach(crowdLevel, crowdTarget, dt * (crowdTarget > crowdLevel ? 1.6 : 0.5));
+      crowdGain.gain.setTargetAtTime(crowdLevel, ac.currentTime, 0.05);
+      api.tempo = 96 + 74 * api.intensity + (api.roundBoost || 0);
+      if (!playing) { nextStep = ac.currentTime + 0.05; return; }
+      var stepDur = 60 / api.tempo / 2;
+      if (nextStep < ac.currentTime) nextStep = ac.currentTime + 0.02;
+      while (nextStep < ac.currentTime + 0.12) {
+        var s = step % 8;
+        if (s === 0 || s === 4) ching(nextStep, false);
+        if (s === 2 || s === 6) ching(nextStep, true);
+        if (s === 0 || s === 3 || s === 5) drum(nextStep, true);
+        if (s === 2 || s === 6 || s === 7) drum(nextStep, false);
+        if (api.intensity > 0.45 && (s === 1 || s === 4)) drum(nextStep, false);
+        nextStep += stepDur; step++;
+      }
+    };
+    api.setCrowdBase = function (v) { crowdBase = v; };
+    return api;
+  })();
+
+  /* ---------- Input ---------- */
+  var keys = {};
+  var pressedQ = [];
+  var GAME_KEYS = ['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter', 'KeyA', 'KeyD', 'KeyW', 'KeyS',
+    'KeyJ', 'KeyK', 'KeyL', 'KeyU', 'KeyI', 'Escape', 'Tab'];
+  window.addEventListener('keydown', function (e) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (GAME_KEYS.indexOf(e.code) >= 0) e.preventDefault();
+    Sound.init();
+    if (!e.repeat) pressedQ.push(e.code);
+    keys[e.code] = true;
+  });
+  window.addEventListener('keyup', function (e) { keys[e.code] = false; });
+  window.addEventListener('blur', function () { keys = {}; });
+  var mouse = { x: 0, y: 0, down: false };
+  function toLogical(e) { return { x: (e.clientX - VX) / VS, y: (e.clientY - VY) / VS }; }
+  cv.addEventListener('mousedown', function (e) {
+    Sound.init(); var p = toLogical(e); mouse.x = p.x; mouse.y = p.y; mouse.down = true;
+    if (screen && screen.onDown) screen.onDown(p.x, p.y);
+  });
+  window.addEventListener('mouseup', function () { mouse.down = false; if (screen && screen.onUp) screen.onUp(); });
+  cv.addEventListener('mousemove', function (e) {
+    var p = toLogical(e); mouse.x = p.x; mouse.y = p.y;
+    if (screen && screen.onMove) screen.onMove(p.x, p.y);
+  });
+
+  /* ---------- Buttons ---------- */
+  function Button(label, x, y, w, h, action, primary) { return { label: label, x: x, y: y, w: w, h: h, action: action, primary: !!primary }; }
+  function inside(b, x, y) { return x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h; }
+  function drawButton(b, focused) {
+    var hover = inside(b, mouse.x, mouse.y);
+    ctx.save();
+    ctx.fillStyle = b.primary ? (hover || focused ? '#f7b852' : '#d98f22') : (hover || focused ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.07)');
+    roundRect(b.x, b.y, b.w, b.h, 6); ctx.fill();
+    ctx.lineWidth = focused ? 2 : 1;
+    ctx.strokeStyle = b.primary ? '#ffd27a' : (focused ? COL.amber : 'rgba(255,255,255,0.25)');
+    roundRect(b.x + 0.5, b.y + 0.5, b.w - 1, b.h - 1, 6); ctx.stroke();
+    ctx.fillStyle = b.primary ? '#1b1007' : COL.text;
+    ctx.font = font(18, true); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    spaced(1.5); ctx.fillText(b.label.toUpperCase(), b.x + b.w / 2, b.y + b.h / 2 + 1); spaced(0);
+    ctx.restore();
+  }
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath(); ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h); ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r); ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y); ctx.closePath();
+  }
+  function menuKeys(presses, buttons, state) {
+    presses.forEach(function (c) {
+      if (c === 'ArrowDown' || c === 'ArrowRight' || c === 'Tab' || c === 'KeyS') state.focus = (state.focus + 1) % buttons.length;
+      else if (c === 'ArrowUp' || c === 'ArrowLeft' || c === 'KeyW') state.focus = (state.focus + buttons.length - 1) % buttons.length;
+      else if (c === 'Enter' || c === 'Space') { var b = buttons[state.focus]; if (b) b.action(); }
+    });
+  }
+
+  /* ---------- Poses: a simple skeleton with world-space joint angles ---------- */
+  // Limb angles are measured from straight down, positive towards the opponent.
+  // tor: torso lean from vertical (positive forward). hx/hy: hip offsets.
+  var P_KEYS = ['hx', 'hy', 'tor', 'hd', 'lt', 'ls', 'rt', 'rs', 'lua', 'lfa', 'rua', 'rfa'];
+  var STANCE = { hx: 0, hy: 0, tor: 0.02, hd: 0.1, lt: 0.36, ls: -0.04, rt: -0.34, rs: 0.14, lua: 0.72, lfa: 2.78, rua: 0.5, rfa: 2.88 };
+  function mkPose(o) { var p = {}; P_KEYS.forEach(function (k) { p[k] = o[k] != null ? o[k] : STANCE[k]; }); return p; }
+  var POSES = {
+    stance: mkPose({}),
+    guard: mkPose({ tor: 0.14, hd: 0.34, lua: 0.42, lfa: 3.0, rua: 0.3, rfa: 3.06 }),
+    reading: mkPose({ tor: -0.06, hd: 0.02, lua: 1.05, lfa: 2.1, rua: 0.5, rfa: 2.7, lt: 0.44, ls: 0.0, rt: -0.4, rs: 0.22, hy: 5 }),
+    punchW: mkPose({ tor: -0.04, lua: 0.86, lfa: 2.4, hx: -4 }),
+    punch: mkPose({ tor: 0.22, hd: 0.15, hx: 10, lua: 1.56, lfa: 1.58 }),
+    crossW: mkPose({ tor: -0.06, rua: 0.3, rfa: 2.6, hx: -4 }),
+    cross: mkPose({ tor: 0.28, hd: 0.15, hx: 13, rua: 1.52, rfa: 1.56, lua: 0.45, lfa: 2.95 }),
+    elbowW: mkPose({ tor: -0.1, rua: 0.15, rfa: 2.75, hx: -3 }),
+    elbow: mkPose({ tor: 0.32, hd: 0.25, hx: 12, rua: 1.82, rfa: -1.3, lua: 0.55, lfa: 2.95 }),
+    bodyW: mkPose({ tor: -0.14, hx: -5, rt: 0.55, rs: -0.75, lt: 0.22, ls: 0.0, rua: -0.3, rfa: 0.6 }),
+    body: mkPose({ tor: -0.45, hd: 0.15, hx: 8, rt: 1.42, rs: 1.58, lt: 0.08, ls: 0.02, rua: -0.8, rfa: -0.35, lua: 0.6, lfa: 2.95 }),
+    headW: mkPose({ tor: -0.28, hx: -7, rt: 0.85, rs: -0.55, lt: 0.16, ls: 0.0, rua: -0.45, rfa: 0.3 }),
+    head: mkPose({ tor: -0.8, hd: 0.45, hx: 6, rt: 2.1, rs: 2.22, lt: 0.12, ls: 0.04, rua: -0.9, rfa: -0.2, lua: 0.5, lfa: 3.0 }),
+    lowW: mkPose({ tor: -0.07, hx: -3, rt: 0.3, rs: -0.6, lt: 0.26, rua: -0.2, rfa: 0.8 }),
+    low: mkPose({ tor: -0.24, hd: 0.1, hx: 8, rt: 0.98, rs: 1.32, lt: 0.12, ls: 0.04, rua: -0.55, rfa: 0.15 }),
+    teepW: mkPose({ tor: -0.14, lt: 1.5, ls: 0.15, rt: -0.12, rs: 0.1 }),
+    teep: mkPose({ tor: -0.34, hd: 0.2, hx: 6, lt: 1.52, ls: 1.6, rt: -0.18, rs: 0.06, lua: 0.35, lfa: 2.7 }),
+    kneeW: mkPose({ tor: 0.2, hx: -5, rt: 0.2, rs: 0.6, lua: 1.1, lfa: 1.9, rua: 1.0, rfa: 2.0 }),
+    knee: mkPose({ tor: -0.24, hd: 0.3, hx: 16, rt: 1.92, rs: 0.5, lt: 0.06, ls: 0.02, lua: 1.25, lfa: 0.95, rua: 1.2, rfa: 1.05 }),
+    check: mkPose({ tor: 0.0, hd: 0.22, lt: 1.4, ls: 0.12, rt: -0.25, rs: 0.12, lua: 0.5, lfa: 3.0, rua: 0.35, rfa: 3.05 }),
+    lean: mkPose({ tor: -0.62, hd: -0.25, hx: -16, lt: 0.52, ls: 0.2, rt: -0.12, rs: 0.42, lua: 0.45, lfa: 2.95, rua: 0.3, rfa: 2.95 }),
+    'catch': mkPose({ tor: 0.06, hd: 0.15, hx: 2, lua: 1.05, lfa: 1.72, rua: 0.85, rfa: 2.3 }),
+    holding: mkPose({ tor: 0.0, hd: 0.2, lua: 1.3, lfa: 2.1, rua: 1.05, rfa: 1.65, hx: -4 }),
+    step: mkPose({ tor: -0.14, hd: 0.1, hx: -10, lt: 0.56, ls: 0.15, rt: -0.52, rs: 0.0, lua: 0.5, lfa: 2.95, rua: 0.35, rfa: 3.0 }),
+    flinch: mkPose({ tor: -0.26, hd: -0.38, hx: -6 }),
+    stagger: mkPose({ tor: -0.55, hd: -0.7, hx: -14, lua: 0.1, lfa: 1.3, rua: -0.5, rfa: 0.6, lt: 0.55, ls: 0.3, rt: -0.25, rs: 0.2 }),
+    block: mkPose({ tor: 0.02, hd: 0.38, hx: -6, lua: 0.45, lfa: 3.0, rua: 0.32, rfa: 3.05 }),
+    recoil: mkPose({ tor: 0.12, hd: 0.25, rt: 0.6, rs: 0.95, hx: -6, rua: 0.0, rfa: 1.0 }),
+    whiff: mkPose({ tor: 0.36, hd: 0.3, hx: 10 }),
+    held: mkPose({ tor: -0.34, hd: 0.1, rt: 1.42, rs: 1.55, lt: 0.1, ls: 0.0, lua: 0.8, lfa: 2.2, rua: -0.4, rfa: 1.2 }),
+    down: mkPose({ tor: -1.5, hd: 0.15, hx: -30, lt: 1.45, ls: 1.62, rt: 1.15, rs: 1.6, lua: -1.4, lfa: -1.65, rua: -1.1, rfa: -1.45 }),
+    ko: mkPose({ tor: -1.56, hd: -0.35, hx: -42, lt: 1.52, ls: 1.5, rt: 1.32, rs: 1.75, lua: -2.0, lfa: -2.3, rua: -1.45, rfa: -1.7 }),
+    clinch: mkPose({ tor: 0.36, hd: 0.45, hx: 4, lua: 1.5, lfa: 2.3, rua: 1.38, rfa: 2.4, lt: 0.3, rt: -0.42, rs: 0.2 }),
+    cPull: mkPose({ tor: 0.22, hd: 0.3, hx: -6, lua: 1.1, lfa: 1.35, rua: 1.0, rfa: 1.45, lt: 0.25, rt: -0.5 }),
+    cBent: mkPose({ tor: 1.02, hd: 0.7, hx: 8, lua: 1.6, lfa: 2.2, rua: 1.5, rfa: 2.3, rt: -0.6 }),
+    cKnee: mkPose({ tor: 0.22, hd: 0.5, hx: 10, rt: 1.78, rs: 0.35, lt: 0.08, ls: 0.0, lua: 1.35, lfa: 2.0, rua: 1.25, rfa: 2.1 }),
+    cShift: mkPose({ tor: 0.32, hd: 0.4, hx: -12, lt: 0.58, ls: 0.2, rt: -0.62, rs: 0.1, lua: 1.3, lfa: 2.6, rua: 1.1, rfa: 2.4 }),
+    victory: mkPose({ tor: -0.08, hd: -0.25, lua: 2.75, lfa: 2.95, rua: 2.6, rfa: 3.0 })
+  };
+  var ATTACK_POSES = {
+    punch: ['punchW', 'punch'], cross: ['crossW', 'cross'], elbow: ['elbowW', 'elbow'], body: ['bodyW', 'body'],
+    head: ['headW', 'head'], low: ['lowW', 'low'], teep: ['teepW', 'teep'], knee: ['kneeW', 'knee']
+  };
+  // which joint strikes (for telegraph glow and hit sparks)
+  var STRIKER = { punch: 'lHand', cross: 'rHand', elbow: 'rElbow', body: 'rAnkle', head: 'rAnkle', low: 'rAnkle', teep: 'lAnkle', knee: 'rKnee' };
+  var LUNGE = { punch: 10, elbow: 10, teep: 4, low: 8, body: 6, head: 6, knee: 16 };
+  var PUSH = { punch: 10, elbow: 14, teep: 95, low: 6, body: 20, head: 30, knee: 22 };
+  var HIT_HEIGHT = { punch: 0.82, elbow: 0.86, teep: 0.5, low: 0.25, body: 0.55, head: 0.9, knee: 0.5 };
+
+  function blendPose(a, b, t) { var p = {}; P_KEYS.forEach(function (k) { p[k] = a[k] + (b[k] - a[k]) * t; }); return p; }
+  function copyPose(a) { return blendPose(a, a, 0); }
+
+  var SK = { thigh: 56, shin: 54, foot: 18, torso: 80, neck: 10, headR: 16, uarm: 40, farm: 38 };
+
+  // Forward kinematics; feet (or whatever is lowest) rest on the floor.
+  function solve(f) {
+    var p = f.pose, s = f.size, d = f.facing;
+    var J = {};
+    function at(o, ang, len) { return { x: o.x + Math.sin(ang) * len * s * d, y: o.y + Math.cos(ang) * len * s }; }
+    var hip = { x: f.x + p.hx * d, y: 0 };
+    var neck = { x: hip.x + Math.sin(p.tor) * SK.torso * s * d, y: hip.y - Math.cos(p.tor) * SK.torso * s };
+    var ha = p.tor + p.hd;
+    var head = { x: neck.x + Math.sin(ha) * (SK.neck + SK.headR) * s * d, y: neck.y - Math.cos(ha) * (SK.neck + SK.headR) * s };
+    var sh = { x: neck.x - Math.sin(p.tor) * 7 * s * d, y: neck.y + Math.cos(p.tor) * 7 * s };
+    var lSh = { x: sh.x + 3 * s * d, y: sh.y }, rSh = { x: sh.x - 5 * s * d, y: sh.y + 1 };
+    J.hip = hip; J.neck = neck; J.head = head; J.lSh = lSh; J.rSh = rSh;
+    J.lKnee = at(hip, p.lt, SK.thigh); J.lAnkle = at(J.lKnee, p.ls, SK.shin); J.lToe = at(J.lAnkle, p.ls + 1.45, SK.foot);
+    J.rKnee = at(hip, p.rt, SK.thigh); J.rAnkle = at(J.rKnee, p.rs, SK.shin); J.rToe = at(J.rAnkle, p.rs + 1.45, SK.foot);
+    J.lElbow = at(lSh, p.lua, SK.uarm); J.lHand = at(J.lElbow, p.lfa, SK.farm);
+    J.rElbow = at(rSh, p.rua, SK.uarm); J.rHand = at(J.rElbow, p.rfa, SK.farm);
+    var maxY = -1e9;
+    ['lAnkle', 'rAnkle', 'lToe', 'rToe', 'lKnee', 'rKnee', 'hip', 'neck'].forEach(function (k) { if (J[k].y > maxY) maxY = J[k].y; });
+    if (head.y + SK.headR * s > maxY) maxY = head.y + SK.headR * s;
+    var dy = GROUND - maxY - 2 + p.hy;
+    Object.keys(J).forEach(function (k) { J[k].y += dy; });
+    f.J = J;
+    return J;
+  }
+
+  /* ---------- Fighter rendering: silhouettes with rim light ---------- */
+  function seg(a, b, w) { ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke(); }
+  function dot(p, r) { ctx.beginPath(); ctx.arc(p.x, p.y, Math.max(0.5, r), 0, 6.283); ctx.fill(); }
+  // tapered capsule: thick at a, thinner at b
+  function limb(a, b, w1, w2) {
+    var dx = b.x - a.x, dy = b.y - a.y, L = Math.sqrt(dx * dx + dy * dy) || 1, nx = -dy / L, ny = dx / L;
+    ctx.beginPath();
+    ctx.moveTo(a.x + nx * w1 / 2, a.y + ny * w1 / 2); ctx.lineTo(b.x + nx * w2 / 2, b.y + ny * w2 / 2);
+    ctx.lineTo(b.x - nx * w2 / 2, b.y - ny * w2 / 2); ctx.lineTo(a.x - nx * w1 / 2, a.y - ny * w1 / 2);
+    ctx.closePath(); ctx.fill();
+    dot(a, w1 / 2); dot(b, w2 / 2);
+  }
+  function along(a, b, t) { return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t }; }
+  function torsoPath(J, s, grow) {
+    var dx = J.neck.x - J.hip.x, dy = J.neck.y - J.hip.y, L = Math.sqrt(dx * dx + dy * dy) || 1;
+    var ux = dx / L, uy = dy / L, nx = -uy, ny = ux;
+    var hw = (14 + grow) * s, ww = (13 + grow) * s, cw = (21 + grow) * s;
+    var waist = { x: J.hip.x + ux * 22 * s, y: J.hip.y + uy * 22 * s };
+    var chest = { x: J.hip.x + ux * 58 * s, y: J.hip.y + uy * 58 * s };
+    var top = { x: J.neck.x - ux * 3 * s, y: J.neck.y - uy * 3 * s };
+    ctx.beginPath();
+    ctx.moveTo(J.hip.x + nx * hw, J.hip.y + ny * hw);
+    ctx.quadraticCurveTo(waist.x + nx * ww, waist.y + ny * ww, chest.x + nx * cw, chest.y + ny * cw);
+    ctx.quadraticCurveTo(top.x + nx * (cw + 2), top.y + ny * (cw + 2), top.x, top.y - 0);
+    ctx.quadraticCurveTo(top.x - nx * (cw + 2), top.y - ny * (cw + 2), chest.x - nx * cw, chest.y - ny * cw);
+    ctx.quadraticCurveTo(waist.x - nx * ww, waist.y - ny * ww, J.hip.x - nx * hw, J.hip.y - ny * hw);
+    ctx.closePath();
+  }
+  function drawGroup(name, J, s, grow) {
+    var g = grow;
+    switch (name) {
+      case 'rArm': case 'lArm': {
+        var sh = name === 'lArm' ? J.lSh : J.rSh, el = name === 'lArm' ? J.lElbow : J.rElbow, h = name === 'lArm' ? J.lHand : J.rHand;
+        dot(sh, 10 * s + g / 2);
+        limb(sh, el, 17 * s + g, 12 * s + g); limb(el, h, 13 * s + g, 10 * s + g);
+        dot(h, 10.5 * s + g / 2); break;
+      }
+      case 'rLeg': case 'lLeg': {
+        var k = name === 'lLeg' ? J.lKnee : J.rKnee, an = name === 'lLeg' ? J.lAnkle : J.rAnkle, to = name === 'lLeg' ? J.lToe : J.rToe;
+        limb(J.hip, k, 26 * s + g, 16 * s + g);
+        limb(k, along(k, an, 0.35), 16 * s + g, 15 * s + g); limb(along(k, an, 0.35), an, 15 * s + g, 9 * s + g);
+        limb(an, to, 9 * s + g, 6 * s + g); break;
+      }
+      case 'body':
+        torsoPath(J, s, g / 2); ctx.fill();
+        limb(J.neck, along(J.neck, J.head, 0.55), 13 * s + g, 12 * s + g);
+        dot(J.head, SK.headR * s + g / 2);
+        // jaw, so the head reads as facing the opponent
+        dot({ x: J.head.x + (J.neck.x < J.head.x ? 1 : -1) * 0 + (J.lSh.x > J.rSh.x ? 1 : -1) * 6 * s, y: J.head.y + 7 * s }, 9 * s + g / 2);
+        break;
+    }
+  }
+  var ORDER = ['rArm', 'rLeg', 'body', 'lLeg', 'lArm'];
+  function drawFighter(f) {
+    var J = solve(f), s = f.size, d = f.facing;
+    var corner = f.isPlayer ? COL.blue : COL.red;
+    var shorts = f.isPlayer ? COL.blueDeep : COL.redDeep;
+    var glove = f.isPlayer ? '#173a9c' : '#8e1d18';
+    ctx.save();
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    // floor shadow
+    var sx = (J.lAnkle.x + J.rAnkle.x + J.hip.x) / 3;
+    var sg = ctx.createRadialGradient(sx, GROUND + 2, 4, sx, GROUND + 2, 70);
+    sg.addColorStop(0, 'rgba(0,0,0,0.55)'); sg.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = sg; ctx.beginPath(); ctx.ellipse(sx, GROUND + 2, 70, 12, 0, 0, 6.283); ctx.fill();
+    var flash = f.flash || 0;
+    for (var i = 0; i < ORDER.length; i++) {
+      var g = ORDER[i];
+      // cool corner rim from behind
+      ctx.save(); ctx.translate(-d * 2.6, 0.5);
+      ctx.strokeStyle = ctx.fillStyle = corner; ctx.globalAlpha = 0.85; drawGroup(g, J, s, 1.5); ctx.restore();
+      // warm overhead rim
+      ctx.save(); ctx.translate(d * 0.8, -2.4);
+      ctx.strokeStyle = ctx.fillStyle = '#ffd59a'; ctx.globalAlpha = 0.9; drawGroup(g, J, s, 1); ctx.restore();
+      // silhouette
+      var base = flash > 0 ? mixColour('#0c0b10', '#ffffff', flash * 0.55) : (g === 'rArm' || g === 'rLeg' ? '#141218' : '#0b0a0e');
+      ctx.strokeStyle = ctx.fillStyle = base; drawGroup(g, J, s, 0);
+      if (g === 'body' || g === 'lLeg' || g === 'rLeg') drawShorts(g, J, s, shorts);
+      if (g === 'lArm' || g === 'rArm') {
+        var h = g === 'lArm' ? J.lHand : J.rHand;
+        ctx.fillStyle = glove; ctx.beginPath(); ctx.arc(h.x, h.y, 8.5 * s, 0, 6.283); ctx.fill();
+        ctx.strokeStyle = 'rgba(255,214,160,0.55)'; ctx.lineWidth = 1.2; ctx.beginPath(); ctx.arc(h.x, h.y, 8.5 * s, -2.6, -0.6); ctx.stroke();
+      }
+    }
+    // telegraph: the striking limb warms up during the wind-up, scaled to the technique's power
+    if (f.state === 'attack' && f.atk && !f.atk.hit) {
+      var a = f.atk, j = J[STRIKER[a.pose]];
+      var prog = clamp(a.t / a.windup, 0, 1), pw = TECH[a.type].dmg / 12;
+      var r = 10 + 26 * pw;
+      var gg = ctx.createRadialGradient(j.x, j.y, 1, j.x, j.y, r);
+      gg.addColorStop(0, 'rgba(255,190,110,' + (0.75 * prog * (0.4 + 0.6 * pw)).toFixed(3) + ')');
+      gg.addColorStop(1, 'rgba(255,120,40,0)');
+      ctx.globalCompositeOperation = 'lighter'; ctx.fillStyle = gg;
+      ctx.beginPath(); ctx.arc(j.x, j.y, r, 0, 6.283); ctx.fill(); ctx.globalCompositeOperation = 'source-over';
+    }
+    // eyes: the opponent's eyes glow faintly when it is confident it has read you
+    if (!f.isPlayer && f.glow > 0.02 && f.state !== 'ko') {
+      var ex = J.head.x + d * 7 * s, ey = J.head.y - 2 * s;
+      var gl = ctx.createRadialGradient(ex, ey, 0, ex, ey, 14);
+      gl.addColorStop(0, 'rgba(160,250,255,' + (0.55 * f.glow).toFixed(3) + ')'); gl.addColorStop(1, 'rgba(160,250,255,0)');
+      ctx.globalCompositeOperation = 'lighter'; ctx.fillStyle = gl; ctx.beginPath(); ctx.arc(ex, ey, 14, 0, 6.283); ctx.fill();
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.fillStyle = 'rgba(200,255,255,' + (0.9 * f.glow).toFixed(3) + ')';
+      ctx.beginPath(); ctx.ellipse(ex, ey, 2.6, 1.3, 0, 0, 6.283); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(ex - d * 6, ey + 0.5, 2.0, 1.1, 0, 0, 6.283); ctx.fill();
+    }
+    ctx.restore();
+  }
+  function drawShorts(g, J, s, colour) {
+    ctx.strokeStyle = colour; ctx.fillStyle = colour;
+    if (g === 'body') {
+      var dx = J.neck.x - J.hip.x, dy = J.neck.y - J.hip.y, L = Math.sqrt(dx * dx + dy * dy) || 1;
+      var top = { x: J.hip.x + dx / L * 12 * s, y: J.hip.y + dy / L * 12 * s };
+      limb(J.hip, top, 30 * s, 28 * s);
+      ctx.strokeStyle = 'rgba(255,214,140,0.8)'; ctx.lineCap = 'butt';
+      seg({ x: top.x - dy / L * 14 * s, y: top.y + dx / L * 14 * s }, { x: top.x + dy / L * 14 * s, y: top.y - dx / L * 14 * s }, 3.5 * s);
+      ctx.lineCap = 'round';
+    } else {
+      var k = g === 'lLeg' ? J.lKnee : J.rKnee;
+      limb(J.hip, along(J.hip, k, 0.5), 30 * s, 29 * s);
+      ctx.fillStyle = 'rgba(255,214,140,0.35)'; dot(along(J.hip, k, 0.5), 2.2 * s);
+    }
+  }
+  function mixColour(a, b, t) {
+    var pa = parseInt(a.slice(1), 16), pb = parseInt(b.slice(1), 16);
+    var r = Math.round(lerp(pa >> 16, pb >> 16, t)), g = Math.round(lerp((pa >> 8) & 255, (pb >> 8) & 255, t)), bl = Math.round(lerp(pa & 255, pb & 255, t));
+    return 'rgb(' + r + ',' + g + ',' + bl + ')';
+  }
+
+  /* ---------- Stadium ---------- */
+  var BG_W = 1700;
+  function buildBackground() {
+    var c = document.createElement('canvas');
+    var sc = DPR * VS;
+    c.width = Math.max(1, Math.round(BG_W * sc)); c.height = Math.max(1, Math.round(H * sc));
+    var g = c.getContext('2d');
+    g.setTransform(sc, 0, 0, sc, 0, 0);
+    var sky = g.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, '#060507'); sky.addColorStop(0.35, '#120d0a'); sky.addColorStop(0.75, '#1c140e'); sky.addColorStop(1, '#0a0806');
+    g.fillStyle = sky; g.fillRect(0, 0, BG_W, H);
+    // roof trusses
+    g.strokeStyle = 'rgba(70,52,36,0.35)'; g.lineWidth = 3;
+    for (var x = -40; x < BG_W; x += 120) { g.beginPath(); g.moveTo(x, 0); g.lineTo(x + 60, 70); g.lineTo(x + 120, 0); g.stroke(); }
+    g.beginPath(); g.moveTo(0, 70); g.lineTo(BG_W, 70); g.stroke();
+    // light fixtures
+    for (var lx = 230; lx < BG_W; lx += 210) {
+      var lg = g.createRadialGradient(lx, 82, 2, lx, 82, 60);
+      lg.addColorStop(0, 'rgba(255,214,150,0.9)'); lg.addColorStop(0.2, 'rgba(255,170,90,0.35)'); lg.addColorStop(1, 'rgba(255,140,60,0)');
+      g.fillStyle = lg; g.beginPath(); g.arc(lx, 82, 60, 0, 6.283); g.fill();
+      g.fillStyle = '#2a2018'; g.fillRect(lx - 22, 74, 44, 8);
+      g.fillStyle = '#ffe2b0'; g.fillRect(lx - 16, 82, 32, 3);
+    }
+    // banners
+    var bannerCols = ['#5b1b17', '#1c2c55', '#5a4413', '#3d1a40'];
+    for (var bx = 120, i = 0; bx < BG_W; bx += 260, i++) {
+      g.fillStyle = bannerCols[i % 4]; g.globalAlpha = 0.5; g.fillRect(bx, 120, 46, 110); g.globalAlpha = 1;
+      g.strokeStyle = 'rgba(255,200,120,0.25)'; g.lineWidth = 1; g.strokeRect(bx + 4, 124, 38, 102);
+      g.beginPath(); g.moveTo(bx + 23, 140); g.lineTo(bx + 35, 175); g.lineTo(bx + 23, 210); g.lineTo(bx + 11, 175); g.closePath(); g.stroke();
+    }
+    // crowd tiers
+    var rng = EL.makeRng(99);
+    for (var tier = 0; tier < 8; tier++) {
+      var y = 255 + tier * 40, warm = tier / 7;
+      g.fillStyle = 'rgba(' + Math.round(20 + 30 * warm) + ',' + Math.round(15 + 18 * warm) + ',' + Math.round(10 + 10 * warm) + ',1)';
+      g.fillRect(0, y + 18, BG_W, 26);
+      for (var px = rng() * 18; px < BG_W; px += 15 + rng() * 9) {
+        var hy = y + rng() * 8, r = 7 + rng() * 2.5 + tier * 0.35;
+        var lum = 12 + 30 * warm * (0.6 + 0.4 * rng());
+        g.fillStyle = 'rgb(' + Math.round(lum * 1.35) + ',' + Math.round(lum) + ',' + Math.round(lum * 0.75) + ')';
+        g.beginPath(); g.ellipse(px, hy + r * 2.1, r * 1.55, r * 1.4, 0, Math.PI, 0); g.fill();
+        g.beginPath(); g.arc(px, hy + r * 0.6, r, 0, 6.283); g.fill();
+        if (rng() < 0.05) { g.lineWidth = 4; g.strokeStyle = g.fillStyle; g.beginPath(); g.moveTo(px + r, hy + r * 1.6); g.lineTo(px + r * 2, hy - r * 1.5); g.stroke(); }
+        if (warm > 0.4) { g.fillStyle = 'rgba(255,190,120,' + (0.12 * warm).toFixed(3) + ')'; g.beginPath(); g.arc(px - r * 0.3, hy + r * 0.3, r * 0.6, 0, 6.283); g.fill(); }
+      }
+    }
+    // haze over the ring
+    var hz = g.createRadialGradient(BG_W / 2, 420, 40, BG_W / 2, 420, 640);
+    hz.addColorStop(0, 'rgba(255,170,90,0.16)'); hz.addColorStop(1, 'rgba(255,170,90,0)');
+    g.fillStyle = hz; g.fillRect(0, 0, BG_W, H);
+    bgCanvas = c;
+  }
+  var cam = { x: 640, z: 1, shake: 0, sx: 0, sy: 0 };
+  function drawBackdrop(camX) {
+    if (!bgCanvas) buildBackground();
+    var off = -(camX - 640) * 0.35 - (BG_W - W) / 2;
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#050405'; ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.restore();
+    baseTransform();
+    ctx.drawImage(bgCanvas, 0, 0, bgCanvas.width, bgCanvas.height, off, crowdBob, BG_W, H);
+  }
+  var crowdBob = 0;
+  var dust = [];
+  for (var di = 0; di < 46; di++) dust.push({ x: rand(250, 1030), y: rand(90, 560), v: rand(4, 12), p: rand(0, 6) });
+  function drawLights(t) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    [[430, 0.07], [640, 0.1], [850, 0.07]].forEach(function (L) {
+      var g = ctx.createLinearGradient(0, 60, 0, 600);
+      g.addColorStop(0, 'rgba(255,205,140,' + L[1] + ')'); g.addColorStop(1, 'rgba(255,160,80,0)');
+      ctx.fillStyle = g; ctx.beginPath();
+      ctx.moveTo(L[0] - 18, 60); ctx.lineTo(L[0] + 18, 60); ctx.lineTo(L[0] + 230, 600); ctx.lineTo(L[0] - 230, 600); ctx.closePath(); ctx.fill();
+    });
+    ctx.fillStyle = 'rgba(255,220,170,0.5)';
+    dust.forEach(function (m) {
+      var y = (m.y - t * m.v) % 520; if (y < 80) y += 480;
+      var x = m.x + Math.sin(t * 0.3 + m.p) * 14;
+      ctx.globalAlpha = 0.25 + 0.25 * Math.sin(t + m.p);
+      ctx.fillRect(x, y, 1.6, 1.6);
+    });
+    ctx.restore();
+  }
+  function drawRingBack() {
+    // apron top / floor
+    var fl = ctx.createLinearGradient(0, 548, 0, 640);
+    fl.addColorStop(0, '#5c4a37'); fl.addColorStop(0.5, '#8a7356'); fl.addColorStop(1, '#6a5640');
+    ctx.fillStyle = fl;
+    ctx.beginPath(); ctx.moveTo(150, 548); ctx.lineTo(1130, 548); ctx.lineTo(1160, 640); ctx.lineTo(120, 640); ctx.closePath(); ctx.fill();
+    var pool = ctx.createRadialGradient(640, 600, 20, 640, 600, 520);
+    pool.addColorStop(0, 'rgba(255,225,170,0.45)'); pool.addColorStop(1, 'rgba(255,200,140,0)');
+    ctx.fillStyle = pool; ctx.fill();
+    // centre logo, faint
+    ctx.save(); ctx.globalAlpha = 0.18; ctx.strokeStyle = '#2c1f14'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.ellipse(640, 594, 120, 22, 0, 0, 6.283); ctx.stroke(); ctx.restore();
+    // back posts and ropes
+    drawPost(165, 548, 150, COL.blueDeep, 0.75); drawPost(1115, 548, 150, COL.redDeep, 0.75);
+    var ropeCols = ['#b8302a', '#e8e0d4', '#2f56b8', '#e8e0d4'];
+    for (var i = 0; i < 4; i++) {
+      var y = 548 - 38 - i * 36;
+      ctx.strokeStyle = ropeCols[i]; ctx.globalAlpha = 0.55; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(165, y); ctx.quadraticCurveTo(640, y + 5, 1115, y); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+  function drawPost(x, base, hgt, pad, alpha) {
+    ctx.save(); ctx.globalAlpha = alpha;
+    ctx.fillStyle = '#2a2420'; ctx.fillRect(x - 5, base - hgt, 10, hgt);
+    ctx.fillStyle = pad; ctx.fillRect(x - 9, base - hgt + 6, 18, hgt - 30);
+    ctx.fillStyle = 'rgba(255,220,160,0.25)'; ctx.fillRect(x - 9, base - hgt + 6, 3, hgt - 30);
+    ctx.restore();
+  }
+  function drawRingFront() {
+    // front ropes, see-through so the fighters stay readable
+    var ropeCols = ['#c73a32', '#efe6da', '#3561c9', '#efe6da'];
+    for (var i = 0; i < 4; i++) {
+      var y = 640 - 44 - i * 42;
+      ctx.strokeStyle = ropeCols[i]; ctx.globalAlpha = 0.32; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.moveTo(130, y); ctx.quadraticCurveTo(640, y + 7, 1150, y); ctx.stroke();
+      ctx.strokeStyle = 'rgba(255,230,190,0.35)'; ctx.lineWidth = 1; ctx.globalAlpha = 0.4;
+      ctx.beginPath(); ctx.moveTo(130, y - 1.5); ctx.quadraticCurveTo(640, y + 5.5, 1150, y - 1.5); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    drawPost(128, 640, 190, COL.blueDeep, 1); drawPost(1152, 640, 190, COL.redDeep, 1);
+    // apron face
+    var ap = ctx.createLinearGradient(0, 640, 0, 720);
+    ap.addColorStop(0, '#3a1612'); ap.addColorStop(1, '#120705');
+    ctx.fillStyle = ap; ctx.fillRect(-200, 640, 1680, 120);
+    ctx.fillStyle = '#c8952e'; ctx.fillRect(-200, 640, 1680, 3);
+    ctx.save(); ctx.globalAlpha = 0.22; ctx.fillStyle = '#e8b04a'; ctx.font = font(22, 2); ctx.textAlign = 'center'; spaced(10);
+    for (var x = 140; x < 1300; x += 360) ctx.fillText('EIGHT LIMBS', x, 685);
+    spaced(0); ctx.restore();
+  }
+
+  /* ---------- Particles and pop-ups ---------- */
+  var parts = [], popups = [], flashes = [], camFlashes = [];
+  function sweat(x, y, dir, n) {
+    for (var i = 0; i < n; i++) {
+      parts.push({ x: x, y: y, vx: dir * rand(80, 420) + rand(-60, 60), vy: rand(-320, 40), life: rand(0.35, 0.8), t: 0, s: rand(1.2, 3.2) });
+    }
+  }
+  function impactFlash(x, y, size) { flashes.push({ x: x, y: y, r: size, t: 0, life: 0.13 }); }
+  function popup(text, x, y, colour, size, life) {
+    popups.push({ text: text, x: x, y: y, c: colour || COL.text, s: size || 30, t: 0, life: life || 0.9 });
+  }
+  function updateFx(dt) {
+    parts.forEach(function (p) { p.t += dt; p.vy += 900 * dt; p.x += p.vx * dt; p.y += p.vy * dt; if (p.y > GROUND) { p.y = GROUND; p.vy *= -0.2; p.vx *= 0.5; } });
+    parts = parts.filter(function (p) { return p.t < p.life; });
+    flashes.forEach(function (f) { f.t += dt; }); flashes = flashes.filter(function (f) { return f.t < f.life; });
+    popups.forEach(function (p) { p.t += dt; }); popups = popups.filter(function (p) { return p.t < p.life; });
+    camFlashes.forEach(function (p) { p.t += dt; }); camFlashes = camFlashes.filter(function (p) { return p.t < 0.12; });
+  }
+  function drawFx() {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    flashes.forEach(function (f) {
+      var k = 1 - f.t / f.life, r = f.r * (0.6 + 0.8 * (1 - k));
+      var g = ctx.createRadialGradient(f.x, f.y, 0, f.x, f.y, r);
+      g.addColorStop(0, 'rgba(255,255,240,' + (0.95 * k).toFixed(3) + ')'); g.addColorStop(0.35, 'rgba(255,210,140,' + (0.5 * k).toFixed(3) + ')'); g.addColorStop(1, 'rgba(255,150,60,0)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(f.x, f.y, r, 0, 6.283); ctx.fill();
+      ctx.strokeStyle = 'rgba(255,240,210,' + (0.7 * k).toFixed(3) + ')'; ctx.lineWidth = 2;
+      for (var i = 0; i < 6; i++) { var a = i * 1.047 + f.x; ctx.beginPath(); ctx.moveTo(f.x + Math.cos(a) * r * 0.3, f.y + Math.sin(a) * r * 0.3); ctx.lineTo(f.x + Math.cos(a) * r * 1.1, f.y + Math.sin(a) * r * 1.1); ctx.stroke(); }
+    });
+    ctx.globalCompositeOperation = 'source-over';
+    parts.forEach(function (p) {
+      var k = 1 - p.t / p.life;
+      ctx.strokeStyle = 'rgba(200,230,255,' + (0.8 * k).toFixed(3) + ')'; ctx.lineWidth = p.s; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - p.vx * 0.012, p.y - p.vy * 0.012); ctx.stroke();
+    });
+    ctx.restore();
+  }
+  function drawPopups() {
+    popups.forEach(function (p) {
+      var k = p.t / p.life, sc = k < 0.12 ? 1.6 - 0.6 * (k / 0.12) : 1;
+      var a = k > 0.7 ? 1 - (k - 0.7) / 0.3 : 1;
+      ctx.save(); ctx.translate(p.x, p.y - 34 * easeOut(k)); ctx.scale(sc, sc);
+      ctx.globalAlpha = a; ctx.font = font(p.s, 2); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      spaced(2);
+      ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(0,0,0,0.75)'; ctx.strokeText(p.text, 0, 0);
+      if (p.c === COL.cyan) { ctx.shadowColor = 'rgba(120,240,255,0.9)'; ctx.shadowBlur = 18; }
+      ctx.fillStyle = p.c; ctx.fillText(p.text, 0, 0);
+      spaced(0); ctx.restore();
+    });
+  }
+
+  /* ---------- Fight state ---------- */
+  var F = null;             // the current fight
+  var hitStop = 0, slowMo = 0, timeScale = 1;
+  function shake(a) { cam.shake = Math.max(cam.shake, a); }
+
+  function makeFighter(isPlayer, mods, adv, name) {
+    return {
+      isPlayer: isPlayer, name: name, x: isPlayer ? 470 : 810, vx: 0, facing: isPlayer ? 1 : -1,
+      hp: 100, cap: 100 * mods.staminaCap, st: 100 * mods.staminaCap, rec: mods.recovery, power: mods.power, reach: mods.reach,
+      size: 1 + 0.045 * adv, state: 'free', t: 0, atk: null, defType: null, defDur: 0, defRec: 0,
+      guardHeld: false, guard: 0, stunType: '', stunDur: 0, calm: 1, pose: copyPose(STANCE),
+      walk: 0, bob: Math.random() * 6, move: 0, pts: 0, lastStep: -9, dashDir: 0, flash: 0, glow: 0,
+      lastTap: {}, buffer: null, clinchAnim: 'idle', clinchT: 0, downDur: 0, punchAlt: false, hurtTrail: 100
+    };
+  }
+
+  function startFight(oppIndex, playerCut, oppCut) {
+    var opp = EL.OPPONENTS[oppIndex];
+    var mp = EL.cutModifiers(playerCut, oppCut), mo = EL.cutModifiers(oppCut, playerCut);
+    var advP = Math.max(0, playerCut - oppCut) / EL.CUT_MAX, advO = Math.max(0, oppCut - playerCut) / EL.CUT_MAX;
+    var seed = (Date.now() * 31 + oppIndex) >>> 0;
+    F = {
+      opp: opp, oppIndex: oppIndex, playerCut: playerCut, oppCut: oppCut,
+      p: makeFighter(true, mp, advP, 'You'), a: makeFighter(false, mo, advO, opp.name),
+      round: 1, clock: ROUND_TIME, phase: 'intro', phaseT: 0, time: 0,
+      predictor: new EL.Predictor(), prev: 'none', mixes: EL.styleMixes(EQ, opp), rng: EL.makeRng(seed),
+      exchanges: [], rounds: [], kd: { p: 0, a: 0 }, clinch: null, caught: null, result: null,
+      started: new Date().toISOString(), confT: 0, paused: false
+    };
+    F.a.brain = { moveT: 0, atkT: 1.4, plan: null, guardUntil: 0, phase: Math.random() * 6, dumpT: 0 };
+    Sound.intensity = 0.1; Sound.roundBoost = 0;
+    Sound.setMusic(true, 0.3); Sound.setCrowdBase(0.06);
+    resetPositions();
+    setScreen(fightScreen);
+  }
+  function resetPositions() {
+    F.p.x = 470; F.a.x = 810; F.p.vx = F.a.vx = 0;
+    [F.p, F.a].forEach(function (f) { f.state = 'free'; f.t = 0; f.atk = null; f.guardHeld = false; f.guard = 0; f.buffer = null; });
+    F.a.brain.plan = null; F.clinch = null; F.caught = null;
+    cam.x = 640; cam.z = 1;
+  }
+
+  // the range band as seen by a fighter: a size edge from cutting makes the opponent effectively closer
+  function bandFor(f) { return F.clinch ? 'clinch' : EL.bandOf(Math.abs(F.a.x - F.p.x) - f.reach); }
+  function slowFactor(f) { return f.st < 40 ? 1 + 0.75 * (1 - f.st / 40) : 1; }
+  function canAct(f) {
+    return f.state === 'free' || (f.state === 'defend' && (f.defType === 'check' || f.defType === 'lean') && f.t < 0.3);
+  }
+  function setState(f, s) { f.state = s; f.t = 0; }
+
+  /* ---------- Starting techniques ---------- */
+  function startAttack(f, type, aiDecision) {
+    var band = bandFor(f);
+    if (band === 'clinch') return false;
+    if (type === 'punch' && band === 'close') type = 'elbow';
+    var T = TECH[type], slow = slowFactor(f);
+    if (f.st < 2) return false;
+    var poseName = type;
+    if (type === 'punch') { f.punchAlt = !f.punchAlt; poseName = f.punchAlt ? 'punch' : 'cross'; }
+    f.atk = { type: type, pose: poseName, band: band, t: 0, windup: T.windup * slow, recover: T.recover * slow, hit: false };
+    setState(f, 'attack');
+    f.guardHeld = false;
+    f.st = Math.max(0, f.st - T.cost); f.calm = 0;
+    Sound.intensity = Math.min(1, Sound.intensity + 0.025);
+    if (T.dmg >= 7) Sound.breath();
+    var ex = { t: +F.time.toFixed(2), time: new Date().toISOString(), round: F.round, band: band,
+      initiator: f.isPlayer ? 'player' : 'ai', playerAction: null, aiPrediction: null, aiAction: null,
+      aiMode: null, confidence: null, outcome: null, value: null, read: false };
+    f.atk.ex = ex;
+    if (f.isPlayer) {
+      ex.playerAction = type;
+      aiDefend(F.a, f, ex);
+      if (EL.STRIKE_BANDS.indexOf(band) >= 0) { F.predictor.observe(band, F.prev, type); F.prev = type; }
+    } else {
+      ex.aiAction = type; ex.aiMode = aiDecision.mode; ex.aiPrediction = aiDecision.predicted; ex.confidence = +aiDecision.confidence.toFixed(3);
+    }
+    return true;
+  }
+  var DEF_TIME = { check: [0.38, 0.16], lean: [0.36, 0.16], 'catch': [0.32, 0.26], step: [0.28, 0.06] };
+  function startDefence(f, type) {
+    if (f.state !== 'free' && !(f.state === 'defend' && f.t > 0.2)) return false;
+    var slow = slowFactor(f);
+    setState(f, 'defend'); f.defType = type;
+    f.defDur = DEF_TIME[type][0] / Math.sqrt(slow); f.defRec = DEF_TIME[type][1] * slow;
+    f.st = Math.max(0, f.st - 2);
+    if (type === 'step') f.lastStep = F.time;
+    return true;
+  }
+  function startDash(f, dir) {
+    if (f.state !== 'free' || f.st < 5) return;
+    setState(f, 'dash'); f.dashDir = dir; f.st -= 5; f.calm = 0;
+    Sound.whoosh(0.5);
+  }
+  function defenceOf(f) {
+    if (f.state === 'defend' && f.t <= f.defDur) return f.defType;
+    if (f.state === 'dash' && f.dashDir === -f.facing) return 'step';
+    if ((f.state === 'free' || (f.state === 'stun' && f.stunType === 'block')) && f.guard > 0.6) return 'guard';
+    return 'none';
+  }
+
+  /* ---------- The opponent's brain ---------- */
+  // Called the moment the player starts a technique. The opponent commits to
+  // a defence from what it has learned so far, without seeing the technique.
+  function aiDefend(ai, att, ex) {
+    var band = att.atk.band;
+    if (EL.STRIKE_BANDS.indexOf(band) < 0) { ex.aiMode = 'none'; return; }
+    var d = EL.decide('defend', F.predictor, band, F.prev, F.mixes, F.opp.learn, F.rng);
+    ex.aiPrediction = d.predicted; ex.confidence = +d.confidence.toFixed(3);
+    var lead = d.action === 'step' ? 0.17 : d.action === 'guard' ? 0.13 : 0.12;
+    var wait = Math.max(0, att.atk.windup - lead);
+    // a confident read lets it abandon its own wind-up to counter
+    var cancellable = ai.state === 'attack' && ai.atk && !ai.atk.hit && d.mode === 'read';
+    var free = busyFor(ai) <= wait || cancellable;
+    if (!free || ai.brain.plan) { ex.aiAction = 'none'; ex.aiMode = 'busy'; return; }
+    if (cancellable) { ai.atk = null; setState(ai, 'free'); }
+    ex.aiAction = d.action; ex.aiMode = d.mode;
+    ai.brain.plan = { type: d.action, at: F.time + wait };
+  }
+  // how long until this fighter could start a defence
+  function busyFor(f) {
+    switch (f.state) {
+      case 'free': return 0;
+      case 'attack': return f.atk ? Math.max(0, f.atk.windup + f.atk.recover - f.atk.t) : 0;
+      case 'defend': return Math.max(0, f.defDur + f.defRec - f.t);
+      case 'stun': return Math.max(0, f.stunDur - f.t);
+      case 'dash': return Math.max(0, 0.17 - f.t);
+      case 'counter': return Math.max(0, 0.3 - f.t);
+      default: return 99;
+    }
+  }
+  var PREFER_DIST = { long: 235, mid: 158, close: 88 };
+  function aiThink(ai, p, dt) {
+    var B = ai.brain, style = F.opp;
+    if (B.plan && F.time >= B.plan.at) {
+      if (ai.state === 'defend' || ai.state === 'dash' || ai.state === 'counter' || (ai.state === 'attack' && ai.atk && ai.atk.hit)) { ai.atk = null; setState(ai, 'free'); }
+      if (ai.state === 'free') {
+        if (B.plan.type === 'guard') { ai.guardHeld = true; B.guardUntil = F.time + 0.45; }
+        else startDefence(ai, B.plan.type);
+      }
+      B.plan = null;
+    }
+    if (B.guardUntil && F.time > B.guardUntil) { ai.guardHeld = false; B.guardUntil = 0; }
+    // confidence display: how sure it is about your next technique at this range
+    F.confT -= dt;
+    if (F.confT <= 0) {
+      F.confT = 0.2;
+      var band = bandFor(F.p);
+      if (EL.STRIKE_BANDS.indexOf(band) >= 0 || band === 'clinch') {
+        var set = EL.BAND_ATTACKS[band];
+        var q = F.predictor.predict(band, F.prev, set);
+        B.conf = EL.confidence(q, set) * style.learn;
+      } else B.conf = (B.conf || 0) * 0.8;
+    }
+    ai.glow = approach(ai.glow, clamp(((B.conf || 0) - 0.42) / 0.38, 0, 1), dt * 1.5);
+    if (F.clinch) return;
+    ai.move = 0;
+    if (ai.state !== 'free' || B.plan || ai.guardHeld) return;
+    var dist = Math.abs(p.x - ai.x), bandHere = EL.bandOf(dist - ai.reach);
+    var want = PREFER_DIST[style.prefer] + Math.sin(F.time * 1.1 + B.phase) * 34;
+    if (ai.st < 30) want = 270;
+    if (p.st < 25 && ai.st > 45) want = PREFER_DIST.close + 20;
+    B.moveT -= dt;
+    if (B.moveT <= 0) {
+      B.moveT = rand(0.16, 0.42);
+      var diff = dist - want;
+      if (diff > 22) B.dir = 1; else if (diff < -22) B.dir = -1; else B.dir = Math.random() < 0.5 ? 0 : (Math.random() < 0.5 ? 1 : -1);
+      if (diff > 140 && Math.random() < 0.35) startDash(ai, ai.facing);
+      if (ai.x > X_MAX - 30 && B.dir < 0) B.dir = 1;
+    }
+    ai.move = B.dir || 0;
+    // attacks
+    B.atkT -= dt;
+    var opening = (p.state === 'attack' && p.atk && p.atk.hit) || p.state === 'stun' || (p.state === 'defend' && p.t > p.defDur);
+    if (opening && bandHere !== 'out' && Math.random() < 6 * dt) B.atkT = Math.min(B.atkT, 0);
+    if (B.atkT <= 0) {
+      B.atkT = rand(0.8, 1.7) / style.aggression * (ai.st < 35 ? 1.7 : 1);
+      if (bandHere === 'out') return;
+      // confident it knows what you will throw: stay ready to counter instead of attacking
+      if ((B.conf || 0) > 0.4 && Math.random() < B.conf) { B.atkT = rand(0.3, 0.6); return; }
+      if (bandHere === 'close' && Math.random() < style.clinch) { tryClinch(ai, p); return; }
+      var dcs = EL.decide('attack', F.predictor, bandHere, F.prev, F.mixes, style.learn, F.rng);
+      if (ai.st > TECH[dcs.action].cost + 2) startAttack(ai, dcs.action, dcs);
+    }
+  }
+
+  /* ---------- Player control ---------- */
+  function playerControl(p, presses) {
+    p.guardHeld = !!keys.Space;
+    presses.forEach(function (c) {
+      if (c === 'KeyJ' || c === 'KeyK' || c === 'KeyL' || c === 'KeyU') p.buffer = { c: c, t: F.time };
+      else if (c === 'KeyS') { if (!(p.buffer && F.time - p.buffer.t < 0.05)) startDefence(p, 'check'); }
+      else if (c === 'KeyW') { if (!(p.buffer && F.time - p.buffer.t < 0.05)) startDefence(p, 'lean'); }
+      else if (c === 'KeyI') startDefence(p, 'catch');
+      else if (c === 'KeyA' || c === 'KeyD') {
+        var dir = c === 'KeyD' ? 1 : -1;
+        if (F.time - (p.lastTap[c] || -9) < 0.25) startDash(p, dir);
+        else if (dir < 0 && F.time - p.lastStep > 0.45 && p.x > X_MIN + 15) startDefence(p, 'step');
+        p.lastTap[c] = F.time;
+      }
+    });
+    if (p.buffer && F.time - p.buffer.t > 0.2) p.buffer = null;
+    if (p.buffer && canAct(p)) {
+      var c = p.buffer.c, ok = false;
+      if (p.state === 'defend') setState(p, 'free');
+      if (c === 'KeyJ') ok = startAttack(p, 'punch');
+      else if (c === 'KeyK') ok = startAttack(p, keys.KeyW ? 'head' : keys.KeyS ? 'low' : 'body');
+      else if (c === 'KeyU') ok = startAttack(p, 'teep');
+      else if (c === 'KeyL') {
+        if (keys.KeyD && bandFor(p) === 'close') { tryClinch(p, F.a); ok = true; }
+        else ok = startAttack(p, 'knee');
+      }
+      if (ok) p.buffer = null;
+    }
+    p.move = 0;
+    if (p.state === 'free') p.move = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
+  }
+
+  /* ---------- Clinch ---------- */
+  function tryClinch(f, o) {
+    if (F.clinch || f.state !== 'free') return;
+    if (o.state === 'defend' && (o.defType === 'step' || o.defType === 'lean')) { popup('SLIPPED', o.x, 330, COL.dim, 22); return; }
+    if (o.state === 'down' || o.state === 'ko' || o.state === 'held' || o.state === 'holding') return;
+    if (o.state === 'attack') o.atk = null;
+    var mid = (F.p.x + F.a.x) / 2;
+    mid = clamp(mid, X_MIN + CLINCH_GAP / 2, X_MAX - CLINCH_GAP / 2);
+    F.p.x = mid - CLINCH_GAP / 2; F.a.x = mid + CLINCH_GAP / 2;
+    [F.p, F.a].forEach(function (x) { setState(x, 'clinch'); x.guardHeld = false; x.clinchAnim = 'idle'; x.clinchT = 0; x.vx = 0; });
+    F.a.brain.plan = null;
+    F.clinch = { posture: 0, beat: 0, beatT: 0, beatLen: 0.62, beats: 0, playerMove: null, ai: null, t: 0, initiator: f.isPlayer ? 'player' : 'ai' };
+    clinchNewBeat();
+    Sound.thud(0.4); Sound.swell(0.08);
+    popup('CLINCH', mid, 330, COL.gold, 26, 0.7);
+  }
+  function clinchNewBeat() {
+    var C = F.clinch;
+    C.beatT = 0; C.playerMove = null;
+    C.ai = EL.decide('clinch', F.predictor, 'clinch', F.prev, F.mixes, F.opp.learn, F.rng);
+  }
+  function clinchUpdate(dt, presses) {
+    var C = F.clinch, p = F.p, a = F.a;
+    C.t += dt; C.beatT += dt;
+    presses.forEach(function (c) {
+      if (c === 'KeyA' || c === 'KeyD') C.playerMove = 'shift';
+      else if (c === 'KeyJ') C.playerMove = 'pull';
+      else if (c === 'KeyL') C.playerMove = 'cknee';
+      else if (c === 'KeyK' && C.posture >= 60) { dump(p, a); }
+    });
+    if (!F.clinch) return;
+    C.posture = approach(C.posture, 0, dt * 9);
+    // the opponent dumps you once you are off balance
+    if (C.posture <= -60) {
+      a.brain.dumpT += dt;
+      if (a.brain.dumpT > 0.32) { dump(a, p); return; }
+    } else a.brain.dumpT = 0;
+    if (C.beatT >= C.beatLen) {
+      var pm = C.playerMove || 'none', am = C.ai.action;
+      var v = EL.clinchValue(pm, am);
+      var ex = { t: +F.time.toFixed(2), time: new Date().toISOString(), round: F.round, band: 'clinch', initiator: 'clinch',
+        playerAction: pm, aiPrediction: C.ai.predicted, aiAction: am, aiMode: C.ai.mode, confidence: +C.ai.confidence.toFixed(3),
+        outcome: v > 0 ? 'player won beat' : v < 0 ? 'opponent won beat' : 'even', value: v, read: false };
+      var winner = v > 0 ? p : v < 0 ? a : null, loser = winner === p ? a : winner === a ? p : null;
+      var wMove = winner === p ? pm : am;
+      p.st = Math.max(0, p.st - 1.5 - (pm === 'cknee' ? 3 : 0)); a.st = Math.max(0, a.st - 1.5 - (am === 'cknee' ? 3 : 0));
+      p.clinchAnim = pm === 'none' ? 'idle' : pm; a.clinchAnim = am; p.clinchT = a.clinchT = 0;
+      if (winner) {
+        var sign = winner === p ? 1 : -1;
+        winner.pts += Math.abs(v) * winner.power;
+        if (wMove === 'cknee') {
+          var dmg = TECH.knee.dmg * DMG_SCALE * winner.power * EL.absorbFactor(loser.st) * (Math.abs(C.posture) > 30 && Math.sign(C.posture) === sign ? 1.25 : 1);
+          hurt(loser, dmg);
+          C.posture = clamp(C.posture + sign * 12, -100, 100);
+          var j = loser.J ? loser.J.hip : { x: loser.x, y: 500 };
+          impactFlash(j.x, j.y - 20, 50); sweat(j.x, j.y - 40, -loser.facing, 10);
+          hitStop = Math.max(hitStop, 0.07); shake(6); Sound.thud(1); Sound.oi(); Sound.swell(0.12);
+          loser.clinchAnim = 'kneed';
+        } else if (wMove === 'pull') {
+          C.posture = clamp(C.posture + sign * 32, -100, 100); Sound.block(0.6);
+          loser.clinchAnim = 'bent';
+        } else if (wMove === 'shift') {
+          C.posture = clamp(C.posture + sign * 26, -100, 100); Sound.block(0.4);
+        }
+        popup(LABEL[wMove].toUpperCase(), winner.x, 300, winner === p ? COL.text : '#ffb4ac', 20, 0.6);
+        if (winner === a && C.ai.mode === 'read' && C.ai.predicted === pm) { ex.read = true; readPopup(); }
+      } else if (pm === 'cknee' && am === 'cknee') {
+        hurt(p, 3 * DMG_SCALE); hurt(a, 3 * DMG_SCALE); Sound.thud(0.6); shake(3);
+      }
+      ex.value = +v.toFixed(2);
+      logExchange(ex);
+      if (pm !== 'none') { F.predictor.observe('clinch', F.prev, pm); F.prev = pm; }
+      if (!F.clinch) return;
+      C.beats++;
+      if (C.beats >= 7) { breakClinch('BREAK'); return; }
+      clinchNewBeat();
+    }
+  }
+  function dump(winner, loser) {
+    var C = F.clinch;
+    breakClinch(null);
+    winner.pts += 5 * winner.power;
+    setState(loser, 'down'); loser.downDur = 1.0;
+    setState(winner, 'stun'); winner.stunType = 'whiff'; winner.stunDur = 0.25;
+    hurt(loser, 5 * DMG_SCALE * winner.power);
+    loser.vx = -loser.facing * 120;
+    popup('DUMPED', loser.x, 330, winner === F.p ? COL.gold : '#ffb4ac', 40, 1.1);
+    Sound.floor(); Sound.swell(0.3); shake(9); hitStop = Math.max(hitStop, 0.1);
+    Sound.intensity = Math.min(1, Sound.intensity + 0.2);
+    logExchange({ t: +F.time.toFixed(2), time: new Date().toISOString(), round: F.round, band: 'clinch', initiator: 'clinch',
+      playerAction: winner === F.p ? 'dump' : 'none', aiPrediction: null, aiAction: winner === F.a ? 'dump' : 'none', aiMode: null,
+      confidence: null, outcome: winner === F.p ? 'player dumped opponent' : 'opponent dumped player', value: winner === F.p ? 5 : -5, read: false });
+    void C;
+  }
+  function breakClinch(label) {
+    if (!F.clinch) return;
+    F.clinch = null;
+    [F.p, F.a].forEach(function (f) { setState(f, 'free'); f.clinchAnim = 'idle'; });
+    F.p.vx = -260; F.a.vx = 260;
+    if (label) popup(label, (F.p.x + F.a.x) / 2, 320, COL.dim, 26, 0.8);
+  }
+
+  /* ---------- Resolving a technique at the moment of impact ---------- */
+  function readPopup() {
+    popup('READ', F.a.x, 250, COL.cyan, 40, 1.0);
+    Sound.swell(0.1);
+  }
+  function hurt(f, dmg) {
+    f.hp -= dmg; f.st = Math.max(0, f.st - 2); f.flash = 1; f.calm = 0;
+    if (f.hp <= 0 && F.phase === 'fight') knockout(f);
+  }
+  function stun(f, type, dur) {
+    if (f.state === 'ko') return;
+    if (f.state === 'attack' && f.atk && !f.atk.hit) { f.atk.cancelled = true; logCancelled(f); }
+    setState(f, 'stun'); f.stunType = type; f.stunDur = dur; f.atk = null;
+    if (type !== 'block' && !f.isPlayer) f.guardHeld = false;
+  }
+  function logCancelled(f) {
+    var ex = f.atk && f.atk.ex;
+    if (!ex) return;
+    ex.outcome = 'interrupted'; ex.value = 0;
+    if (!f.isPlayer) ex.playerAction = 'none';
+    logExchange(ex);
+  }
+  function strikePoint(att, def, type) {
+    var J = def.J || solve(def);
+    var hh = HIT_HEIGHT[type];
+    var top = J.head.y - SK.headR, bottom = GROUND;
+    return { x: def.x - def.facing * 6, y: lerp(bottom, top, hh) };
+  }
+  function resolveImpact(att) {
+    var def = att === F.p ? F.a : F.p;
+    var a = att.atk, type = a.type, band = a.band, T = TECH[type];
+    var ex = a.ex;
+    if (def.state === 'down' || def.state === 'ko' || F.phase !== 'fight') { finishExchange(att, def, ex, 0, 'down', 'missed'); return; }
+    var dist = Math.abs(def.x - att.x);
+    var dState = defenceOf(def);
+    var outcome, v;
+    if (!EL.attackValidIn(band, type)) { outcome = dist > T.reach + att.reach ? 'missed' : 'jammed'; v = -0.5; }
+    else if (dist > T.reach + att.reach + 36 && dState !== 'step') { outcome = 'missed'; v = -0.5; }
+    else { outcome = EL.outcomeType(band, type, dState); v = EL.outcomeValue(band, type, dState); }
+    var hp = strikePoint(att, def, type), dirX = att.facing;
+    var heavy = T.dmg / 12;
+    switch (outcome) {
+      case 'clean': {
+        var dmg = T.dmg * DMG_SCALE * att.power * EL.absorbFactor(def.st);
+        att.pts += v * att.power;
+        var staggers = T.dmg >= EL.STAGGER_DMG;
+        def.vx += dirX * PUSH[type] * 4;
+        stun(def, staggers ? 'stagger' : 'flinch', staggers ? 0.36 : 0.16);
+        hurt(def, dmg);
+        impactFlash(hp.x, hp.y, 34 + 46 * heavy);
+        sweat(hp.x, hp.y, dirX, 5 + Math.round(T.dmg * 1.4));
+        hitStop = Math.max(hitStop, 0.04 + 0.014 * v);
+        shake(2 + T.dmg * 0.75 * att.power);
+        if (type === 'punch' || type === 'elbow') Sound.thud(0.5 + 0.5 * heavy); else Sound.slap(0.6 + 0.5 * heavy);
+        if (type === 'knee' || type === 'elbow' || type === 'head') Sound.thud(0.9 * heavy + 0.2);
+        Sound.swell(0.03 * v); Sound.intensity = Math.min(1, Sound.intensity + 0.035 * v);
+        if (type === 'knee') Sound.oi();
+        if (type === 'head') { popup('HEAD KICK', hp.x, hp.y - 50, COL.gold, 30); Sound.swell(0.2); camFlash(8); }
+        break;
+      }
+      case 'blocked': {
+        att.pts += v * att.power;
+        def.vx += dirX * PUSH[type] * 2.2;
+        if (def.state !== 'defend') stun(def, 'block', 0.12);
+        hurt(def, T.dmg * DMG_SCALE * 0.25 * att.power);
+        impactFlash(hp.x, hp.y, 18 + 16 * heavy);
+        hitStop = Math.max(hitStop, 0.025);
+        shake(1 + T.dmg * 0.2);
+        Sound.block(0.6 + 0.4 * heavy);
+        break;
+      }
+      case 'evaded': case 'missed': case 'jammed': {
+        a.recover += 0.12;
+        Sound.whoosh(0.6 + heavy);
+        popup(outcome === 'jammed' ? 'JAMMED' : 'MISSED', att.x + att.facing * 40, 360, COL.faint, 18, 0.6);
+        break;
+      }
+      case 'checked': {
+        def.pts += -v;
+        hurt(att, 6 * DMG_SCALE * def.power * EL.absorbFactor(att.st));
+        stun(att, 'recoil', 0.45);
+        popup('CHECKED', def.x, 330, def.isPlayer ? COL.gold : '#ffb4ac', 36);
+        impactFlash(hp.x, GROUND - 120, 40);
+        Sound.crack(); shake(5); hitStop = Math.max(hitStop, 0.08);
+        Sound.swell(0.1);
+        break;
+      }
+      case 'caught': {
+        def.pts += -v;
+        setState(att, 'held'); att.atk = null;
+        setState(def, 'holding'); def.guardHeld = false;
+        F.caught = { catcher: def, victim: att, t: 0 };
+        popup('CAUGHT', def.x, 320, def.isPlayer ? COL.gold : '#ffb4ac', 34);
+        Sound.block(0.7); Sound.swell(0.08);
+        break;
+      }
+      case 'countered': {
+        def.pts += -v;
+        setState(def, 'counter'); def.guardHeld = false;
+        hurt(att, 7 * DMG_SCALE * def.power * EL.absorbFactor(att.st));
+        stun(att, 'stagger', 0.36);
+        var cp = strikePoint(def, att, 'punch');
+        impactFlash(cp.x, cp.y, 46); sweat(cp.x, cp.y, -dirX, 9);
+        popup('COUNTER', def.x, 320, def.isPlayer ? COL.gold : '#ffb4ac', 34);
+        Sound.thud(0.9); shake(6); hitStop = Math.max(hitStop, 0.07); Sound.swell(0.1);
+        break;
+      }
+    }
+    // The opponent read you: its prediction-driven counter just won the exchange
+    if (ex) {
+      if (att.isPlayer) { if (ex.aiMode === 'read' && v < 0) ex.read = true; }
+      else if (ex.aiMode === 'read' && v > 0 && ex.aiPrediction === dState) ex.read = true;
+      if (ex.read) readPopup();
+    }
+    finishExchange(att, def, ex, v, dState, outcome);
+  }
+  function finishExchange(att, def, ex, v, dState, outcome) {
+    if (!ex) return;
+    if (outcome) ex.outcome = outcome;
+    if (att.isPlayer) ex.value = +v.toFixed(2);
+    else {
+      ex.value = +(-v).toFixed(2);
+      ex.playerAction = dState;
+      if (dState !== 'down' && EL.STRIKE_BANDS.indexOf(ex.band) >= 0) { F.predictor.observe(ex.band, F.prev, dState); F.prev = dState; }
+    }
+    logExchange(ex);
+  }
+  function logExchange(ex) {
+    if (F && ex && !ex._logged) { Object.defineProperty(ex, '_logged', { value: true }); F.exchanges.push(ex); }
+  }
+  function camFlash(n) { for (var i = 0; i < n; i++) camFlashes.push({ x: rand(0, W), y: rand(240, 520), t: -rand(0, 0.25) }); }
+
+  function updateCatch(dt, presses) {
+    var C = F.caught; if (!C) return;
+    C.t += dt;
+    var choice = null;
+    if (C.catcher.isPlayer) {
+      presses.forEach(function (c) { if (c === 'KeyK') choice = 'sweep'; else if (c === 'KeyJ') choice = 'counter'; });
+      if (!choice && C.t > 0.55) choice = 'sweep';
+    } else if (C.t > 0.38) choice = Math.random() < (F.opp.id === 'nattapong' ? 0.3 : 0.6) ? 'sweep' : 'counter';
+    if (!choice) return;
+    var cat = C.catcher, vic = C.victim;
+    F.caught = null;
+    if (choice === 'sweep') {
+      setState(vic, 'down'); vic.downDur = 0.9;
+      hurt(vic, 5 * DMG_SCALE * cat.power);
+      setState(cat, 'free');
+      popup('SWEPT', vic.x, 330, cat.isPlayer ? COL.gold : '#ffb4ac', 40);
+      Sound.floor(); shake(8); hitStop = Math.max(hitStop, 0.09); Sound.swell(0.25); camFlash(6);
+      Sound.intensity = Math.min(1, Sound.intensity + 0.15);
+    } else {
+      setState(cat, 'counter');
+      hurt(vic, 7 * DMG_SCALE * cat.power * EL.absorbFactor(vic.st));
+      stun(vic, 'stagger', 0.4);
+      var cp = strikePoint(cat, vic, 'punch');
+      impactFlash(cp.x, cp.y, 50); sweat(cp.x, cp.y, cat.facing, 10);
+      popup('COUNTERED', vic.x, 330, cat.isPlayer ? COL.gold : '#ffb4ac', 34);
+      Sound.thud(1); shake(7); hitStop = Math.max(hitStop, 0.08); Sound.swell(0.15);
+    }
+  }
+
+  function knockout(f) {
+    var w = f === F.p ? F.a : F.p;
+    F.clinch = null; F.caught = null;
+    f.hp = 0; setState(f, 'ko'); f.atk = null;
+    if (w.state === 'clinch' || w.state === 'holding' || w.state === 'held') setState(w, 'free');
+    f.vx = -f.facing * 220;
+    F.phase = 'ko'; F.phaseT = 0;
+    F.result = { winner: w.isPlayer ? 'player' : 'ai', method: 'KO', round: F.round, time: +(ROUND_TIME - F.clock).toFixed(1) };
+    slowMo = 2.2; hitStop = 0.18; shake(16);
+    Sound.swell(0.8); Sound.thud(1.4); Sound.floor(); Sound.intensity = 1; camFlash(30);
+    if (f.isPlayer) F.kd.p++; else F.kd.a++;
+  }
+
+  /* ---------- Fighter physics and animation ---------- */
+  function updateFighter(f, o, dt, impacts) {
+    f.t += dt; f.calm += dt;
+    f.flash = Math.max(0, f.flash - dt * 6);
+    f.hurtTrail = approach(f.hurtTrail, f.hp, dt * 18);
+    if (f.state !== 'attack' && f.state !== 'clinch' && f.calm > 0.7) f.st = Math.min(f.cap, f.st + 15 * f.rec * (f.guardHeld ? 0.45 : 1) * dt);
+    if (f.state === 'clinch' && f.calm > 0.7) f.st = Math.min(f.cap, f.st + 4 * f.rec * dt);
+    var wantGuard = f.guardHeld && (f.state === 'free' || (f.state === 'stun' && f.stunType === 'block'));
+    f.guard = approach(f.guard, wantGuard ? 1 : 0, dt * (wantGuard ? 9 / slowFactor(f) : 7));
+    switch (f.state) {
+      case 'free': {
+        var spd = (f.move > 0 ? 175 : 155) * (f.guard > 0.5 ? 0.55 : 1) / Math.sqrt(slowFactor(f));
+        f.x += f.move * f.facing * spd * dt;
+        if (f.move !== 0) f.walk += dt * 9; else f.walk = 0;
+        break;
+      }
+      case 'attack': {
+        var a = f.atk;
+        if (!a) { setState(f, 'free'); break; }
+        a.t += dt;
+        var sStart = Math.max(0, a.windup - 0.07);
+        if (a.t > sStart && a.t <= a.windup) f.x += f.facing * LUNGE[a.type] / 0.07 * dt;
+        if (!a.hit && a.t >= a.windup) { a.hit = true; impacts.push(f); }
+        if (a.t >= a.windup + a.recover) { setState(f, 'free'); f.atk = null; }
+        break;
+      }
+      case 'defend':
+        if (f.defType === 'step' && f.t < 0.22) f.x -= f.facing * 330 * dt;
+        if (f.t >= f.defDur + f.defRec) setState(f, 'free');
+        break;
+      case 'stun': if (f.t >= f.stunDur) setState(f, 'free'); break;
+      case 'down': if (f.t >= f.downDur) { setState(f, 'stun'); f.stunType = 'flinch'; f.stunDur = 0.2; } break;
+      case 'counter': if (f.t >= 0.3) setState(f, 'free'); break;
+      case 'dash': f.x += f.dashDir * 560 * dt; if (f.t >= 0.17) setState(f, 'free'); break;
+      case 'clinch': f.clinchT += dt; break;
+    }
+    f.x += f.vx * dt; f.vx *= Math.exp(-9 * dt);
+  }
+  function constrain() {
+    var p = F.p, a = F.a;
+    var gap = F.clinch ? CLINCH_GAP : MIN_GAP;
+    p.x = clamp(p.x, X_MIN, X_MAX - gap); a.x = clamp(a.x, X_MIN + gap, X_MAX);
+    if (a.x - p.x < gap) {
+      var push = (gap - (a.x - p.x)) / 2;
+      p.x -= push; a.x += push;
+      if (p.x < X_MIN) { a.x += X_MIN - p.x; p.x = X_MIN; }
+      if (a.x > X_MAX) { p.x -= a.x - X_MAX; a.x = X_MAX; }
+    }
+  }
+  function attackTarget(f, base) {
+    var a = f.atk, names = ATTACK_POSES[a.pose];
+    var Wp = POSES[names[0]], S = POSES[names[1]];
+    var sStart = Math.max(0, a.windup - 0.07);
+    if (a.t < sStart) return { p: blendPose(base, Wp, easeOut(a.t / Math.max(0.01, sStart))), rate: 26 };
+    if (a.t < a.windup + 0.06) return { p: S, rate: 60 };
+    return { p: blendPose(S, base, easeInOut((a.t - a.windup - 0.06) / Math.max(0.05, a.recover - 0.06))), rate: 22 };
+  }
+  function animate(f, dt) {
+    var base = f.isPlayer ? POSES.stance : blendPose(POSES.stance, POSES.reading, f.glow * 0.85);
+    var tgt = base, rate = 14;
+    f.bob += dt * (f.isPlayer ? 3.1 : 3.1 - 1.4 * f.glow);
+    switch (f.state) {
+      case 'free': case 'dash':
+        tgt = blendPose(base, POSES.guard, f.guard);
+        tgt = copyPose(tgt);
+        tgt.hy += -Math.abs(Math.sin(f.bob)) * 3;
+        if (f.walk > 0) { var s = Math.sin(f.walk); tgt.lt += s * 0.26; tgt.rt -= s * 0.26; tgt.ls += Math.max(0, -s) * 0.3; tgt.rs += Math.max(0, s) * 0.3; tgt.hy -= Math.abs(s) * 2; }
+        if (f.state === 'dash') { tgt.tor += f.dashDir === f.facing ? 0.2 : -0.2; tgt.lt += 0.2; tgt.rt -= 0.25; }
+        rate = 16; break;
+      case 'attack': var r = attackTarget(f, base); tgt = r.p; rate = r.rate; break;
+      case 'defend': tgt = POSES[f.defType]; rate = 30; if (f.t > f.defDur) { tgt = base; rate = 14; } break;
+      case 'stun': tgt = POSES[f.stunType] || POSES.flinch; rate = f.stunType === 'stagger' ? 20 : 26; break;
+      case 'held': tgt = copyPose(POSES.held); tgt.hy = -Math.abs(Math.sin(f.t * 14)) * 6; rate = 24; break;
+      case 'holding': tgt = POSES.holding; rate = 24; break;
+      case 'counter': tgt = f.t < 0.16 ? POSES.cross : base; rate = 40; break;
+      case 'down': tgt = POSES.down; rate = 9; break;
+      case 'ko': tgt = POSES.ko; rate = 5; break;
+      case 'win': tgt = POSES.victory; rate = 6; break;
+      case 'clinch': {
+        var ca = f.clinchAnim, k = f.clinchT;
+        var C = F && F.clinch;
+        tgt = POSES.clinch;
+        if (C) {
+          var mine = f.isPlayer ? C.posture : -C.posture;
+          if (mine < 0) tgt = blendPose(POSES.clinch, POSES.cBent, clamp(-mine / 90, 0, 1));
+        }
+        if (k < 0.3) {
+          if (ca === 'cknee') tgt = POSES.cKnee; else if (ca === 'pull') tgt = POSES.cPull; else if (ca === 'shift') tgt = POSES.cShift;
+          else if (ca === 'bent' || ca === 'kneed') tgt = POSES.cBent;
+        }
+        rate = 18; break;
+      }
+    }
+    var kk = 1 - Math.exp(-rate * dt);
+    P_KEYS.forEach(function (key) { f.pose[key] += (tgt[key] - f.pose[key]) * kk; });
+  }
+
+  /* ---------- Fight update ---------- */
+  function fightUpdate(dt, presses) {
+    if (F.paused) {
+      presses.forEach(function (c) { if (c === 'Escape' || c === 'Enter') F.paused = false; });
+      return;
+    }
+    if (presses.indexOf('Escape') >= 0 && (F.phase === 'fight' || F.phase === 'intro')) { F.paused = true; return; }
+    F.phaseT += dt;
+    var p = F.p, a = F.a;
+    if (F.phase === 'intro') {
+      if (F.phaseT > 1.2 && !F.belled) { F.belled = true; Sound.bell(1); Sound.swell(0.15); }
+      if (F.phaseT > 1.9) { F.phase = 'fight'; F.phaseT = 0; F.belled = false; }
+      p.move = a.move = 0;
+    } else if (F.phase === 'fight') {
+      F.time += dt;
+      F.clock -= dt;
+      if (F.clinch) clinchUpdate(dt, presses);
+      else if (F.caught) updateCatch(dt, presses);
+      else playerControl(p, presses);
+      if (F.clinch || F.caught) p.move = 0;
+      aiThink(a, p, dt);
+      if (F.clock <= 0 && F.phase === 'fight') endRound();
+    } else if (F.phase === 'roundEnd') {
+      p.move = a.move = 0;
+      if (F.phaseT > 3.4 || (F.phaseT > 1 && presses.indexOf('Enter') >= 0)) nextRound();
+    } else if (F.phase === 'ko') {
+      if (F.phaseT > 1.1) {
+        var w = F.result.winner === 'player' ? p : a;
+        if (w.state === 'free' || w.state === 'stun' || w.state === 'attack') { setState(w, 'win'); w.atk = null; }
+      }
+      if ((F.phaseT > 4.2 && presses.indexOf('Enter') >= 0) || F.phaseT > 9) { finishFight(); return; }
+      p.move = a.move = 0;
+    } else if (F.phase === 'decision') {
+      if ((F.phaseT > 1.2 && presses.indexOf('Enter') >= 0) || F.phaseT > 9) { finishFight(); return; }
+      p.move = a.move = 0;
+    }
+    if (!F) return;
+    var impacts = [];
+    updateFighter(p, a, dt, impacts);
+    updateFighter(a, p, dt, impacts);
+    constrain();
+    impacts.forEach(function (f) { if (f.atk && !f.atk.cancelled && F.phase === 'fight') resolveImpact(f); });
+    animate(p, dt); animate(a, dt);
+    updateFx(dt);
+    // camera
+    var mid = (p.x + a.x) / 2, dist = Math.abs(a.x - p.x);
+    var tz = 1 + 0.13 * clamp((330 - dist) / 250, 0, 1);
+    if (F.phase === 'ko') { var v = F.result.winner === 'player' ? a : p; mid = lerp(mid, v.x, 0.5); tz = 1.22; }
+    cam.x = lerp(cam.x, clamp(mid, 520, 760), 1 - Math.exp(-4 * dt));
+    cam.z = lerp(cam.z, tz, 1 - Math.exp(-3 * dt));
+  }
+
+  function endRound() {
+    var p = F.p, a = F.a;
+    breakClinch(null); F.caught = null;
+    F.phase = 'roundEnd'; F.phaseT = 0;
+    var cards = EL.judgeRound(p.pts, a.pts, 0, 0, F.rng);
+    F.rounds.push({ round: F.round, pointsPlayer: +p.pts.toFixed(2), pointsOpponent: +a.pts.toFixed(2), cards: cards });
+    Sound.bell(3); Sound.swell(0.2);
+    [p, a].forEach(function (f) { if (f.state === 'attack') { f.atk = null; } if (f.state !== 'down') setState(f, 'free'); });
+  }
+  function nextRound() {
+    if (F.round >= ROUNDS) { decision(); return; }
+    F.round++; F.clock = ROUND_TIME; F.phase = 'intro'; F.phaseT = 0;
+    [F.p, F.a].forEach(function (f) { f.pts = 0; f.hp = Math.min(100, f.hp + 10 * f.rec); f.st = f.cap; f.hurtTrail = f.hp; });
+    Sound.roundBoost = (F.round - 1) * 5;
+    resetPositions();
+  }
+  function decision() {
+    var tot = [[0, 0], [0, 0], [0, 0]], pAll = 0, aAll = 0;
+    F.rounds.forEach(function (r) { r.cards.forEach(function (c, j) { tot[j][0] += c[0]; tot[j][1] += c[1]; }); pAll += r.pointsPlayer; aAll += r.pointsOpponent; });
+    var votesP = 0, votesA = 0;
+    tot.forEach(function (t) { if (t[0] > t[1]) votesP++; else if (t[1] > t[0]) votesA++; else if (pAll >= aAll) votesP++; else votesA++; });
+    F.result = { winner: votesP > votesA ? 'player' : 'ai', method: 'Decision', round: ROUNDS, judges: tot, votes: [votesP, votesA] };
+    F.phase = 'decision'; F.phaseT = 0;
+    var w = F.result.winner === 'player' ? F.p : F.a;
+    setState(w, 'win');
+    Sound.swell(0.4); Sound.bell(1);
+  }
+
+  function finishFight() {
+    if (!F || F.finished) return;
+    F.finished = true;
+    var won = F.result.winner === 'player';
+    var analysis = EL.analyseFight(F.exchanges, EQ);
+    var rec = {
+      id: 'fight-' + (career.fights.length + 1), date: F.started, opponentId: F.opp.id, opponentName: F.opp.name, opponentStyle: F.opp.style,
+      learningFactor: F.opp.learn, playerCut: +F.playerCut.toFixed(4), opponentCut: +F.oppCut.toFixed(4),
+      result: won ? 'win' : 'loss', method: F.result.method, endRound: F.result.round, judges: F.result.judges || null,
+      rounds: F.rounds, finalHealth: { player: +Math.max(0, F.p.hp).toFixed(1), opponent: +Math.max(0, F.a.hp).toFixed(1) },
+      analysis: {
+        predictability: analysis.predictability, entropyBits: analysis.entropyBits, predictionAccuracy: analysis.predictionAccuracy,
+        predictions: analysis.predictions, reads: analysis.reads, attackCounts: analysis.counts, mixes: analysis.mixes,
+        rollingAccuracy: analysis.rollingAccuracy
+      },
+      divisionAverageBefore: EL.divisionAverage(career.division),
+      exchanges: F.exchanges
+    };
+    if (won) { career.record.wins++; if (F.result.method === 'KO') career.record.kos++; }
+    else career.record.losses++;
+    if (won && F.oppIndex === career.rung) career.rung++;
+    if (career.rung >= EL.OPPONENTS.length && !career.complete) { career.complete = true; rec.becameChampion = true; }
+    // the division reacts: off-screen bouts, then imitation of winners' cuts
+    var oppEntry = career.division.fighters.filter(function (x) { return x.id === F.opp.id; })[0];
+    var me = { cut: F.playerCut, ai: false };
+    var extra = won ? { winner: me, loser: oppEntry } : { winner: oppEntry, loser: me };
+    EL.divisionStep(career.division, EQ, EL.makeRng((Date.now() ^ career.fights.length * 7777) >>> 0), extra);
+    rec.divisionAverageAfter = EL.divisionAverage(career.division);
+    career.fights.push(rec);
+    saveCareer();
+    Sound.setMusic(false, 0.3); Sound.setCrowdBase(0.035);
+    var fightRec = rec;
+    F = null; slowMo = 0; hitStop = 0; timeScale = 1;
+    analysisScreen.open(fightRec);
+  }
+
+  /* ---------- Fight rendering ---------- */
+  function renderFight(realT) {
+    var p = F.p, a = F.a;
+    var sx = (Math.random() * 2 - 1) * cam.shake, sy = (Math.random() * 2 - 1) * cam.shake;
+    crowdBob = Math.sin(realT * 2.2) * (0.5 + 2.5 * Sound.intensity);
+    drawBackdrop(cam.x);
+    // crowd camera flashes
+    ctx.save();
+    camFlashes.forEach(function (c) { if (c.t < 0) return; ctx.fillStyle = 'rgba(255,255,255,' + (1 - c.t / 0.12).toFixed(2) + ')'; ctx.beginPath(); ctx.arc(c.x, c.y, 3, 0, 6.283); ctx.fill(); });
+    ctx.restore();
+    ctx.save();
+    ctx.translate(W / 2 + sx, 430 + sy); ctx.scale(cam.z, cam.z); ctx.translate(-cam.x, -430);
+    drawLights(realT);
+    drawRingBack();
+    var order = (a.state === 'attack' || a.state === 'counter') ? [p, a] : [a, p];
+    order.forEach(drawFighter);
+    drawFx();
+    drawRingFront();
+    drawPopups();
+    ctx.restore();
+    drawHud();
+  }
+  function bar(x, y, w, h, frac, colour, trail, rtl) {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(x - 2, y - 2, w + 4, h + 4);
+    ctx.fillStyle = '#2a2420'; ctx.fillRect(x, y, w, h);
+    if (trail != null) { ctx.fillStyle = 'rgba(255,240,220,0.55)'; var tw = w * clamp(trail, 0, 1); ctx.fillRect(rtl ? x + w - tw : x, y, tw, h); }
+    var fw = w * clamp(frac, 0, 1);
+    ctx.fillStyle = colour; ctx.fillRect(rtl ? x + w - fw : x, y, fw, h);
+    ctx.fillStyle = 'rgba(255,255,255,0.18)'; ctx.fillRect(rtl ? x + w - fw : x, y, fw, Math.max(1, h * 0.35));
+  }
+  function drawHud() {
+    var p = F.p, a = F.a;
+    ctx.save();
+    var grd = ctx.createLinearGradient(0, 0, 0, 110); grd.addColorStop(0, 'rgba(0,0,0,0.75)'); grd.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = grd; ctx.fillRect(0, 0, W, 110);
+    // names
+    ctx.font = font(18, 2); ctx.textBaseline = 'alphabetic'; spaced(1.5);
+    ctx.textAlign = 'left'; ctx.fillStyle = COL.blue; ctx.fillText('YOU', 40, 36);
+    ctx.textAlign = 'right'; ctx.fillStyle = COL.red; ctx.fillText(F.opp.name.toUpperCase(), W - 40, 36);
+    spaced(0);
+    ctx.font = font(12, false); ctx.fillStyle = COL.dim;
+    ctx.textAlign = 'left'; ctx.fillText('Cut ' + pct(F.playerCut), 40 + 300 * p.cap / 100 + 14, 76);
+    ctx.textAlign = 'right'; ctx.fillText(F.opp.gym + '   Cut ' + pct(F.oppCut), W - 40 - 300 * a.cap / 100 - 14, 76);
+    bar(40, 46, 440, 16, p.hp / 100, '#4f8fff', p.hurtTrail / 100, false);
+    bar(W - 480, 46, 440, 16, a.hp / 100, '#ff4d42', a.hurtTrail / 100, true);
+    bar(40, 68, 300 * p.cap / 100, 7, p.st / p.cap, p.st < 40 ? '#e0703a' : '#e8c25a', null, false);
+    bar(W - 40 - 300 * a.cap / 100, 68, 300 * a.cap / 100, 7, a.st / a.cap, a.st < 40 ? '#e0703a' : '#e8c25a', null, true);
+    // round and clock
+    ctx.textAlign = 'center';
+    ctx.font = font(14, true); ctx.fillStyle = COL.amber; spaced(3); ctx.fillText('ROUND ' + F.round + ' / ' + ROUNDS, W / 2, 28); spaced(0);
+    var secs = Math.max(0, Math.ceil(F.clock));
+    ctx.font = font(34, 2); ctx.fillStyle = F.clock < 10 && F.phase === 'fight' ? '#ff9c6b' : COL.text;
+    ctx.fillText('0:' + (secs < 10 ? '0' : '') + secs, W / 2, 64);
+    var band = bandFor(p);
+    ctx.font = font(12, true); ctx.fillStyle = COL.dim; spaced(3);
+    ctx.fillText(band === 'out' ? 'OUT OF RANGE' : band === 'clinch' ? 'CLINCH' : band.toUpperCase() + ' RANGE', W / 2, 84); spaced(0);
+    // clinch posture tug-of-war
+    if (F.clinch) drawClinchHud();
+    if (F.caught && F.caught.catcher.isPlayer) {
+      ctx.font = font(16, true); ctx.fillStyle = COL.gold; ctx.fillText('K  SWEEP     J  COUNTER', W / 2, 140);
+    }
+    ctx.restore();
+    // overlays
+    if (F.phase === 'intro') { if (F.phaseT < 1.2) roundCard('ROUND ' + F.round, F.phaseT, 0.95); else roundCard('FIGHT', F.phaseT - 1.2, 0.4); }
+    if (F.phase === 'roundEnd') roundEndCard();
+    if (F.phase === 'ko' && F.phaseT > 0.6) koCard();
+    if (F.phase === 'decision') decisionCard();
+    if (F.paused) {
+      ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = 'center'; ctx.fillStyle = COL.text; ctx.font = font(48, 2); ctx.fillText('PAUSED', W / 2, H / 2);
+      ctx.font = font(18, false); ctx.fillStyle = COL.dim; ctx.fillText('Press Enter or Esc to resume', W / 2, H / 2 + 40);
+    }
+  }
+  function drawClinchHud() {
+    var C = F.clinch, cx = W / 2, y = 150, w = 360;
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; roundRect(cx - w / 2 - 14, y - 26, w + 28, 74, 8); ctx.fill();
+    ctx.fillStyle = '#3a1612'; ctx.fillRect(cx - w / 2, y, w * 0.2, 12);
+    ctx.fillStyle = '#152a5c'; ctx.fillRect(cx + w * 0.3, y, w * 0.2, 12);
+    ctx.fillStyle = '#2a2420'; ctx.fillRect(cx - w * 0.3, y, w * 0.6, 12);
+    var nx = cx + (C.posture / 100) * w / 2;
+    ctx.fillStyle = C.posture >= 60 ? COL.gold : C.posture <= -60 ? '#ff8c80' : COL.text;
+    ctx.fillRect(nx - 3, y - 6, 6, 24);
+    var k = C.beatT / C.beatLen;
+    ctx.strokeStyle = 'rgba(255,210,122,' + (0.3 + 0.6 * k).toFixed(2) + ')'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(cx, y + 6, 26 * (1 - k) + 6, 0, 6.283); ctx.stroke();
+    ctx.font = font(12, true); ctx.textAlign = 'center'; ctx.fillStyle = COL.dim; spaced(2);
+    ctx.fillText('A/D SHIFT    J PULL    L KNEE' + (C.posture >= 60 ? '    K DUMP' : ''), cx, y + 38);
+    ctx.fillText('POSTURE', cx, y - 10);
+    spaced(0);
+  }
+  function roundCard(text, t, fadeAt) {
+    var k = clamp(t / 0.25, 0, 1), sc = 1.8 - 0.8 * easeOut(k), al = t > fadeAt ? Math.max(0, 1 - (t - fadeAt) / 0.3) : 1;
+    ctx.save();
+    ctx.globalAlpha = al * 0.75; ctx.fillStyle = '#000'; ctx.fillRect(0, H / 2 - 60, W, 120);
+    ctx.globalAlpha = al; ctx.fillStyle = '#c8952e'; ctx.fillRect(0, H / 2 - 62, W, 2); ctx.fillRect(0, H / 2 + 60, W, 2);
+    ctx.translate(W / 2, H / 2); ctx.scale(sc, sc);
+    ctx.font = font(64, 2); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; spaced(8);
+    ctx.fillStyle = text === 'FIGHT' ? COL.gold : COL.text; ctx.fillText(text, 0, 2); spaced(0);
+    ctx.restore();
+  }
+  function cardBox(h) {
+    ctx.fillStyle = 'rgba(8,6,5,0.88)'; roundRect(W / 2 - 330, H / 2 - h / 2, 660, h, 10); ctx.fill();
+    ctx.strokeStyle = 'rgba(242,169,59,0.6)'; ctx.lineWidth = 1.5; roundRect(W / 2 - 330, H / 2 - h / 2, 660, h, 10); ctx.stroke();
+  }
+  function roundEndCard() {
+    var r = F.rounds[F.rounds.length - 1]; if (!r) return;
+    ctx.save(); cardBox(220);
+    ctx.textAlign = 'center'; ctx.fillStyle = COL.amber; ctx.font = font(16, true); spaced(4);
+    ctx.fillText('END OF ROUND ' + r.round, W / 2, H / 2 - 70); spaced(0);
+    ctx.font = font(15, true); ctx.fillStyle = COL.dim;
+    ctx.fillText('JUDGE', W / 2 - 200, H / 2 - 30); ctx.fillText('YOU', W / 2 - 20, H / 2 - 30); ctx.fillText(F.opp.name.split(' ')[0].toUpperCase(), W / 2 + 160, H / 2 - 30);
+    r.cards.forEach(function (c, j) {
+      var y = H / 2 + 2 + j * 30;
+      ctx.fillStyle = COL.dim; ctx.font = font(18, false); ctx.fillText(String(j + 1), W / 2 - 200, y);
+      ctx.font = font(22, 2);
+      ctx.fillStyle = c[0] >= c[1] ? COL.blue : COL.text; ctx.fillText(String(c[0]), W / 2 - 20, y);
+      ctx.fillStyle = c[1] >= c[0] ? COL.red : COL.text; ctx.fillText(String(c[1]), W / 2 + 160, y);
+    });
+    ctx.restore();
+  }
+  function koCard() {
+    var t = F.phaseT - 0.6, k = clamp(t / 0.3, 0, 1);
+    ctx.save();
+    ctx.globalAlpha = 0.8 * k; ctx.fillStyle = '#000'; ctx.fillRect(0, H / 2 - 80, W, 160); ctx.globalAlpha = 1;
+    ctx.translate(W / 2, H / 2 - 8); var sc = 2 - easeOut(k); ctx.scale(sc, sc);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = font(78, 2); spaced(10);
+    ctx.fillStyle = F.result.winner === 'player' ? COL.gold : '#ff6a5e'; ctx.fillText('KNOCKOUT', 0, 0); spaced(0);
+    ctx.restore();
+    if (t > 1) {
+      ctx.textAlign = 'center'; ctx.font = font(20, true); ctx.fillStyle = COL.text;
+      ctx.fillText(F.result.winner === 'player' ? 'You win in round ' + F.result.round : F.opp.name + ' wins in round ' + F.result.round, W / 2, H / 2 + 52);
+      if (F.phaseT > 4.2) { ctx.font = font(14, false); ctx.fillStyle = COL.dim; ctx.fillText('Press Enter', W / 2, H / 2 + 74); }
+    }
+  }
+  function decisionCard() {
+    var R = F.result;
+    ctx.save(); cardBox(270);
+    ctx.textAlign = 'center'; ctx.fillStyle = COL.amber; ctx.font = font(16, true); spaced(4);
+    ctx.fillText("JUDGES' DECISION", W / 2, H / 2 - 95); spaced(0);
+    R.judges.forEach(function (t, j) {
+      ctx.font = font(22, 2); ctx.fillStyle = t[0] > t[1] ? COL.blue : t[1] > t[0] ? COL.red : COL.text;
+      ctx.fillText(t[0] + ' - ' + t[1], W / 2 - 180 + j * 180, H / 2 - 40);
+      ctx.font = font(13, false); ctx.fillStyle = COL.dim; ctx.fillText('Judge ' + (j + 1), W / 2 - 180 + j * 180, H / 2 - 64);
+    });
+    ctx.font = font(34, 2); ctx.fillStyle = R.winner === 'player' ? COL.gold : '#ff6a5e';
+    var how = R.votes[0] === 3 || R.votes[1] === 3 ? 'unanimous' : 'split';
+    ctx.fillText(R.winner === 'player' ? 'YOU WIN' : F.opp.name.split(' ')[0].toUpperCase() + ' WINS', W / 2, H / 2 + 30);
+    ctx.font = font(16, false); ctx.fillStyle = COL.dim; ctx.fillText('by ' + how + ' decision', W / 2, H / 2 + 62);
+    if (F.phaseT > 1.2) ctx.fillText('Press Enter', W / 2, H / 2 + 100);
+    ctx.restore();
+  }
+
+  var fightScreen = {
+    update: function (dt, presses) { fightUpdate(dt, presses); },
+    render: function (t) { if (F) renderFight(t); }
+  };
+
+  /* ---------- Shared screen backdrop ---------- */
+  var menuT = 0;
+  var showP = makeFighter(true, EL.cutModifiers(0, 0), 0, ''), showA = makeFighter(false, EL.cutModifiers(0, 0), 0, '');
+  showP.x = 520; showA.x = 760;
+  function menuBackdrop(t, dim, fighters) {
+    crowdBob = Math.sin(t * 1.4) * 1;
+    drawBackdrop(640);
+    ctx.save();
+    ctx.translate(W / 2, 430); ctx.scale(1.0, 1.0); ctx.translate(-640, -430);
+    drawLights(t); drawRingBack();
+    if (fighters) {
+      [showA, showP].forEach(function (f) { f.bob += 0.016 * 3; animate(f, 1 / 60); drawFighter(f); });
+    }
+    drawRingFront();
+    ctx.restore();
+    ctx.fillStyle = 'rgba(5,4,3,' + dim + ')'; ctx.fillRect(0, 0, W, H);
+  }
+  function panel(x, y, w, h) {
+    ctx.fillStyle = COL.panel; roundRect(x, y, w, h, 10); ctx.fill();
+    ctx.strokeStyle = 'rgba(242,169,59,0.35)'; ctx.lineWidth = 1; roundRect(x + 0.5, y + 0.5, w - 1, h - 1, 10); ctx.stroke();
+  }
+  function heading(text, x, y, size, align) {
+    ctx.font = font(size || 16, true); ctx.textAlign = align || 'left'; ctx.fillStyle = COL.amber; spaced(3);
+    ctx.fillText(text.toUpperCase(), x, y); spaced(0);
+  }
+
+  /* ---------- Title ---------- */
+  var titleScreen = {
+    state: { focus: 0 }, buttons: [],
+    build: function () {
+      var s = this, bs = [];
+      if (career) bs.push(Button(career.complete ? 'Career summary' : 'Continue career', 90, 430, 300, 50, function () { career.complete ? setScreen(careerScreen) : setScreen(ladderScreen); }, true));
+      bs.push(Button('New career', 90, career ? 494 : 430, 300, 50, function () {
+        if (career && !s.confirm) { s.confirm = true; return; }
+        career = newCareer(); saveCareer(); s.confirm = false; setScreen(ladderScreen);
+      }, !career));
+      s.buttons = bs; s.state.focus = 0;
+    },
+    enter: function () { this.confirm = false; this.build(); Sound.setMusic(false, 0.2); Sound.setCrowdBase(0.04); },
+    update: function (dt, presses) { menuKeys(presses, this.buttons, this.state); },
+    onDown: function (x, y) { this.buttons.forEach(function (b) { if (inside(b, x, y)) b.action(); }); },
+    render: function (t) {
+      showP.x = 760; showA.x = 1000;
+      menuBackdrop(t, 0.35, true);
+      var g = ctx.createLinearGradient(0, 0, 640, 0); g.addColorStop(0, 'rgba(0,0,0,0.85)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = g; ctx.fillRect(0, 0, 760, H);
+      ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+      ctx.font = font(84, 2); spaced(6);
+      ctx.fillStyle = 'rgba(255,160,60,0.25)'; ctx.fillText('EIGHT', 84, 196); ctx.fillText('LIMBS', 84, 286);
+      ctx.fillStyle = COL.text; ctx.fillText('EIGHT', 80, 192); ctx.fillStyle = COL.amber; ctx.fillText('LIMBS', 80, 282);
+      spaced(0);
+      ctx.font = font(18, false); ctx.fillStyle = COL.dim;
+      ctx.fillText('Muay Thai. Six opponents. Every one of them is studying you.', 84, 330);
+      if (career) {
+        ctx.font = font(14, false); ctx.fillStyle = COL.faint;
+        ctx.fillText('Record ' + career.record.wins + '-' + career.record.losses + '   Ladder ' + Math.min(career.rung, 6) + ' / 6', 92, 410);
+      }
+      var s = this;
+      this.buttons.forEach(function (b, i) { drawButton(b, s.state.focus === i); });
+      if (this.confirm) { ctx.font = font(14, false); ctx.fillStyle = '#ff9c6b'; ctx.textAlign = 'left'; ctx.fillText('This replaces your saved career. Choose again to confirm.', 92, 572); }
+      if (!storage.available) { ctx.font = font(13, false); ctx.fillStyle = COL.faint; ctx.textAlign = 'left'; ctx.fillText('Storage unavailable: progress will not be saved.', 92, 600); }
+      drawControls(860, 84);
+    }
+  };
+  function drawControls(x, y) {
+    panel(x - 20, y - 34, 400, 300);
+    heading('Controls', x, y - 8, 14);
+    var rows = [['A / D', 'Step (double-tap to dash)'], ['J', 'Punch (elbow when close)'], ['K', 'Body kick'], ['W + K / S + K', 'Head kick / low kick'],
+      ['L', 'Knee'], ['U', 'Teep'], ['Space (hold)', 'Guard'], ['S / W (tap)', 'Check / lean back'], ['I', 'Catch, then K sweep or J counter'],
+      ['A (tap)', 'Step back'], ['D + L (close)', 'Clinch: A/D shift, J pull, L knee, K dump']];
+    ctx.font = font(13, false);
+    rows.forEach(function (r, i) {
+      ctx.textAlign = 'left'; ctx.fillStyle = COL.gold; ctx.fillText(r[0], x, y + 20 + i * 22);
+      ctx.fillStyle = COL.text; ctx.fillText(r[1], x + 118, y + 20 + i * 22);
+    });
+  }
+
+  /* ---------- Ladder ---------- */
+  var ladderScreen = {
+    state: { focus: 0 }, buttons: [],
+    enter: function () {
+      var s = this, next = Math.min(career.rung, EL.OPPONENTS.length - 1);
+      s.buttons = [];
+      if (career.complete) s.buttons.push(Button('Career summary', 900, 640, 320, 50, function () { setScreen(careerScreen); }, true));
+      else {
+        var lost = career.fights.length && career.fights[career.fights.length - 1].opponentId === EL.OPPONENTS[next].id && career.fights[career.fights.length - 1].result === 'loss';
+        s.buttons.push(Button(lost ? 'Rematch' : 'Weigh-in', 900, 640, 320, 50, function () { weighScreen.open(next); }, true));
+      }
+      s.buttons.push(Button('Title', 60, 640, 160, 50, function () { setScreen(titleScreen); }));
+      s.state.focus = 0;
+      Sound.setMusic(false, 0.2);
+    },
+    update: function (dt, presses) {
+      if (presses.indexOf('Escape') >= 0) { setScreen(titleScreen); return; }
+      menuKeys(presses, this.buttons, this.state);
+    },
+    onDown: function (x, y) { this.buttons.forEach(function (b) { if (inside(b, x, y)) b.action(); }); },
+    render: function (t) {
+      menuBackdrop(t, 0.72, false);
+      ctx.textBaseline = 'alphabetic';
+      heading('The ladder', 60, 60, 18);
+      ctx.font = font(14, false); ctx.fillStyle = COL.dim; ctx.textAlign = 'left';
+      ctx.fillText('Record ' + career.record.wins + '-' + career.record.losses + (career.record.kos ? ' (' + career.record.kos + ' KO)' : ''), 60, 84);
+      var next = career.rung;
+      EL.OPPONENTS.forEach(function (o, i) {
+        var y = 110 + i * 86, beaten = i < career.rung, isNext = i === next && !career.complete, locked = i > next;
+        ctx.globalAlpha = locked ? 0.45 : 1;
+        panel(60, y, 1160, 76);
+        if (isNext) { ctx.strokeStyle = COL.amber; ctx.lineWidth = 2; roundRect(61, y + 1, 1158, 74, 10); ctx.stroke(); }
+        ctx.font = font(30, 2); ctx.fillStyle = beaten ? COL.gold : COL.faint; ctx.textAlign = 'center'; ctx.fillText(String(i + 1), 100, y + 49);
+        ctx.textAlign = 'left'; ctx.font = font(20, 2); ctx.fillStyle = COL.text; ctx.fillText(o.name.toUpperCase(), 140, y + 32);
+        var nameW = ctx.measureText(o.name.toUpperCase()).width;
+        ctx.font = font(14, true); ctx.fillStyle = COL.amber; ctx.fillText('"' + o.nick + '"   ' + o.style, 140 + nameW + 18, y + 32);
+        ctx.font = font(14, false); ctx.fillStyle = COL.dim; ctx.fillText(o.gym + '.  ' + o.line, 140, y + 58);
+        var fights = career.fights.filter(function (f) { return f.opponentId === o.id; });
+        ctx.textAlign = 'right'; ctx.font = font(14, true);
+        ctx.fillStyle = beaten ? COL.gold : isNext ? COL.text : COL.faint;
+        ctx.fillText(beaten ? 'BEATEN' : isNext ? 'NEXT' : 'LOCKED', 1196, y + 32);
+        if (fights.length) {
+          var w = fights.filter(function (f) { return f.result === 'win'; }).length;
+          ctx.font = font(13, false); ctx.fillStyle = COL.dim; ctx.fillText(w + '-' + (fights.length - w) + ' against', 1196, y + 56);
+        }
+        ctx.globalAlpha = 1;
+      });
+      var s = this; this.buttons.forEach(function (b, i) { drawButton(b, s.state.focus === i); });
+    }
+  };
+
+  /* ---------- Weigh-in ---------- */
+  var BASE_WEIGHT = 61.2;
+  var weighScreen = {
+    state: { focus: 0 }, cut: 0.03, revealed: false, revealT: 0, opp: 0, oppCut: 0, dragging: false, buttons: [],
+    slider: { x: 300, y: 560, w: 680 },
+    open: function (oppIndex) {
+      this.opp = oppIndex; this.revealed = false; this.revealT = 0;
+      var entry = career.division.fighters.filter(function (f) { return f.id === EL.OPPONENTS[oppIndex].id; })[0];
+      // the opponent's choice is fixed now, before you choose, and stays hidden until you confirm
+      this.oppCut = Math.round(entry.cut * 1000) / 1000;
+      if (career.fights.length) this.cut = career.fights[career.fights.length - 1].playerCut;
+      this.build();
+      setScreen(this);
+    },
+    build: function () {
+      var s = this;
+      if (!s.revealed) s.buttons = [Button('Confirm cut', 900, 640, 320, 50, function () { s.revealed = true; s.revealT = 0; Sound.thud(0.5); s.build(); }, true)];
+      else s.buttons = [Button('Fight', 900, 640, 320, 50, function () { startFight(s.opp, s.cut, s.oppCut); }, true)];
+      s.buttons.push(Button('Back', 60, 640, 160, 50, function () { setScreen(ladderScreen); }));
+      s.state.focus = 0;
+    },
+    enter: function () { Sound.setMusic(false, 0.2); },
+    update: function (dt, presses) {
+      var s = this;
+      if (s.revealed) s.revealT += dt;
+      if (!s.revealed) presses.forEach(function (c) {
+        if (c === 'ArrowLeft' || c === 'KeyA') s.cut = Math.max(0, Math.round((s.cut - 0.005) * 1000) / 1000);
+        if (c === 'ArrowRight' || c === 'KeyD') s.cut = Math.min(EL.CUT_MAX, Math.round((s.cut + 0.005) * 1000) / 1000);
+      });
+      var filtered = presses.filter(function (c) { return c !== 'ArrowLeft' && c !== 'ArrowRight' && c !== 'KeyA' && c !== 'KeyD'; });
+      if (presses.indexOf('Escape') >= 0) { setScreen(ladderScreen); return; }
+      menuKeys(filtered, this.buttons, this.state);
+    },
+    onDown: function (x, y) {
+      var S = this.slider;
+      if (!this.revealed && x > S.x - 20 && x < S.x + S.w + 20 && y > S.y - 24 && y < S.y + 24) { this.dragging = true; this.onMove(x, y); return; }
+      this.buttons.forEach(function (b) { if (inside(b, x, y)) b.action(); });
+    },
+    onMove: function (x) {
+      if (!this.dragging || this.revealed) return;
+      var S = this.slider; var v = clamp((x - S.x) / S.w, 0, 1) * EL.CUT_MAX;
+      this.cut = Math.round(v * 200) / 200;
+    },
+    onUp: function () { this.dragging = false; },
+    render: function (t) {
+      var s = this, o = EL.OPPONENTS[s.opp];
+      menuBackdrop(t, 0.78, false);
+      ctx.textBaseline = 'alphabetic';
+      heading('Weigh-in', 60, 60, 18);
+      ctx.font = font(14, false); ctx.fillStyle = COL.dim; ctx.textAlign = 'left';
+      ctx.fillText('Lightweight limit ' + BASE_WEIGHT.toFixed(1) + ' kg.  You against ' + o.name + ', ' + o.gym + '.', 60, 84);
+      var rk = s.revealed ? easeOut(s.revealT / 1.3) : 0;
+      drawScale(250, 330, 'YOU', s.cut, COL.blue, 1, false);
+      drawScale(1030, 330, o.name.split(' ')[0].toUpperCase(), s.revealed ? s.oppCut * rk + Math.sin(s.revealT * 20) * 0.01 * (1 - rk) : 0, COL.red, rk, !s.revealed);
+      // slider
+      var S = s.slider;
+      ctx.globalAlpha = s.revealed ? 0.45 : 1;
+      ctx.fillStyle = '#2a2420'; roundRect(S.x, S.y - 5, S.w, 10, 5); ctx.fill();
+      ctx.fillStyle = COL.blue; roundRect(S.x, S.y - 5, S.w * s.cut / EL.CUT_MAX, 10, 5); ctx.fill();
+      var kx = S.x + S.w * s.cut / EL.CUT_MAX;
+      ctx.fillStyle = COL.text; ctx.beginPath(); ctx.arc(kx, S.y, 13, 0, 6.283); ctx.fill();
+      ctx.font = font(13, false); ctx.fillStyle = COL.dim; ctx.textAlign = 'center';
+      for (var i = 0; i <= 10; i += 2) ctx.fillText(i + '%', S.x + S.w * i / 10, S.y + 32);
+      ctx.font = font(16, true); ctx.fillStyle = COL.text; ctx.fillText('Your weight cut: ' + pct(s.cut), S.x + S.w / 2, S.y - 26);
+      ctx.globalAlpha = 1;
+      if (!s.revealed) { ctx.font = font(13, false); ctx.fillStyle = COL.faint; ctx.fillText('Drag or use A / D. Their cut stays hidden until you confirm.', S.x + S.w / 2, S.y + 56); }
+      // effects after the reveal
+      if (s.revealed && s.revealT > 1.2) {
+        var mp = EL.cutModifiers(s.cut, s.oppCut), mo = EL.cutModifiers(s.oppCut, s.cut);
+        var al = clamp((s.revealT - 1.2) / 0.4, 0, 1);
+        ctx.globalAlpha = al;
+        drawMods(100, 452, mp); drawMods(880, 452, mo);
+        ctx.globalAlpha = 1;
+      }
+      // division trend
+      drawTrend(490, 200, 300, 120, career.division.history, 'Division average cut');
+      var s2 = this; this.buttons.forEach(function (b, i) { drawButton(b, s2.state.focus === i); });
+    }
+  };
+  function drawScale(cx, cy, label, cut, colour, reveal, hidden) {
+    panel(cx - 170, cy - 170, 340, 260);
+    ctx.textAlign = 'center';
+    ctx.font = font(16, 2); ctx.fillStyle = colour; spaced(2); ctx.fillText(label, cx, cy - 140); spaced(0);
+    // dial
+    ctx.strokeStyle = '#5a4a3a'; ctx.lineWidth = 10; ctx.beginPath(); ctx.arc(cx, cy, 80, Math.PI * 1.1, Math.PI * 1.9); ctx.stroke();
+    for (var i = 0; i <= 10; i++) {
+      var ang = Math.PI * (1.1 + 0.8 * i / 10);
+      ctx.strokeStyle = COL.dim; ctx.lineWidth = i % 5 === 0 ? 3 : 1.5;
+      ctx.beginPath(); ctx.moveTo(cx + Math.cos(ang) * 68, cy + Math.sin(ang) * 68); ctx.lineTo(cx + Math.cos(ang) * 92, cy + Math.sin(ang) * 92); ctx.stroke();
+    }
+    var walking = BASE_WEIGHT / (1 - cut);
+    var needle = Math.PI * (1.1 + 0.8 * clamp(cut / EL.CUT_MAX, 0, 1));
+    ctx.strokeStyle = colour; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.cos(needle) * 86, cy + Math.sin(needle) * 86); ctx.stroke();
+    ctx.fillStyle = COL.text; ctx.beginPath(); ctx.arc(cx, cy, 7, 0, 6.283); ctx.fill();
+    if (hidden) {
+      ctx.font = font(64, 2); ctx.fillStyle = COL.faint; ctx.fillText('?', cx, cy + 62);
+      ctx.font = font(14, false); ctx.fillText('Cut hidden', cx, cy + 80);
+    } else {
+      ctx.font = font(30, 2); ctx.fillStyle = COL.text; ctx.fillText(pct(cut), cx, cy + 50);
+      ctx.font = font(13, false); ctx.fillStyle = COL.dim;
+      ctx.fillText('On the scale ' + BASE_WEIGHT.toFixed(1) + ' kg   Fight night ' + walking.toFixed(1) + ' kg', cx, cy + 74);
+    }
+    void reveal;
+  }
+  function drawMods(x, y, m) {
+    ctx.textAlign = 'left'; ctx.font = font(14, false);
+    var rows = [['Power', '+' + Math.round((m.power - 1) * 100) + '%'], ['Reach', '+' + Math.round(100 * m.reach / TECH.body.reach) + '%'],
+      ['Stamina cap', Math.round(m.staminaCap * 100) + '%'], ['Recovery', Math.round(m.recovery * 100) + '%']];
+    rows.forEach(function (r, i) {
+      ctx.fillStyle = COL.dim; ctx.fillText(r[0], x + (i % 2) * 170, y + Math.floor(i / 2) * 24);
+      ctx.fillStyle = COL.text; ctx.fillText(r[1], x + 100 + (i % 2) * 170, y + Math.floor(i / 2) * 24);
+    });
+  }
+  function drawTrend(x, y, w, h, hist, label) {
+    panel(x - 16, y - 34, w + 32, h + 62);
+    ctx.textAlign = 'left'; ctx.font = font(12, true); ctx.fillStyle = COL.amber; spaced(2); ctx.fillText(label.toUpperCase(), x, y - 12); spaced(0);
+    var mx = 0.1;
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.lineWidth = 1;
+    [0, 0.05, 0.1].forEach(function (v) { var yy = y + h - h * v / mx; ctx.beginPath(); ctx.moveTo(x, yy); ctx.lineTo(x + w, yy); ctx.stroke(); ctx.fillStyle = COL.faint; ctx.font = font(11, false); ctx.fillText(Math.round(v * 100) + '%', x + w + 4, yy + 4); });
+    if (!hist.length) return;
+    ctx.strokeStyle = COL.amber; ctx.lineWidth = 2.5; ctx.beginPath();
+    hist.forEach(function (v, i) { var xx = x + (hist.length === 1 ? w / 2 : w * i / (hist.length - 1)), yy = y + h - h * v / mx; if (i) ctx.lineTo(xx, yy); else ctx.moveTo(xx, yy); });
+    ctx.stroke();
+    hist.forEach(function (v, i) { var xx = x + (hist.length === 1 ? w / 2 : w * i / (hist.length - 1)), yy = y + h - h * v / mx; ctx.fillStyle = COL.gold; ctx.beginPath(); ctx.arc(xx, yy, 3, 0, 6.283); ctx.fill(); });
+    ctx.font = font(12, false); ctx.fillStyle = COL.dim;
+    ctx.fillText('Start ' + pct(hist[0]) + '   Now ' + pct(hist[hist.length - 1]) + '   (' + (hist.length - 1) + ' fight weeks)', x, y + h + 20);
+  }
+
+  /* ---------- Post-fight analysis ---------- */
+  var analysisScreen = {
+    state: { focus: 0 }, rec: null, buttons: [],
+    open: function (rec) {
+      var s = this; s.rec = rec;
+      s.buttons = [
+        Button('Continue', 900, 650, 320, 48, function () { if (rec.becameChampion) setScreen(careerScreen); else setScreen(ladderScreen); }, true),
+        Button('Download data', 60, 650, 240, 48, downloadData)
+      ];
+      s.state.focus = 0;
+      setScreen(s);
+    },
+    update: function (dt, presses) { menuKeys(presses, this.buttons, this.state); },
+    onDown: function (x, y) { this.buttons.forEach(function (b) { if (inside(b, x, y)) b.action(); }); },
+    render: function (t) {
+      var r = this.rec, A = r.analysis;
+      menuBackdrop(t, 0.86, false);
+      ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left';
+      heading('Fight analysis', 60, 50, 18);
+      ctx.font = font(22, 2); ctx.fillStyle = r.result === 'win' ? COL.gold : '#ff8a7e';
+      var res = (r.result === 'win' ? 'Win' : 'Loss') + ' by ' + (r.method === 'KO' ? 'knockout in round ' + r.endRound : 'decision') + ' against ' + r.opponentName;
+      ctx.fillText(res, 60, 84);
+      // 1. attack mix vs equilibrium
+      panel(40, 108, 760, 330);
+      heading('Your attack mix by range against the equilibrium mix', 60, 136, 13);
+      var bx = 60;
+      EL.BANDS.forEach(function (b) {
+        var acts = EL.BAND_ATTACKS[b], gw = 44 * acts.length + 20;
+        drawMixGroup(bx, 168, gw, 210, b, acts, A.mixes[b], A.attackCounts ? sumObj(A.attackCounts[b]) : 0);
+        bx += gw + 18;
+      });
+      ctx.font = font(12, false); ctx.textAlign = 'left';
+      ctx.fillStyle = COL.blue; ctx.fillRect(60, 420, 14, 8); ctx.fillStyle = COL.dim; ctx.fillText('You', 80, 428);
+      ctx.fillStyle = COL.gold; ctx.fillRect(130, 423, 14, 3); ctx.fillStyle = COL.dim; ctx.fillText('Equilibrium mix', 150, 428);
+      // 2. prediction accuracy
+      panel(820, 108, 420, 230);
+      heading('Opponent prediction accuracy', 840, 136, 13);
+      drawAccuracy(850, 156, 360, 130, A.rollingAccuracy);
+      ctx.font = font(13, false); ctx.fillStyle = COL.dim; ctx.textAlign = 'left';
+      ctx.fillText(A.predictionAccuracy == null ? 'No predictions recorded' : 'Your next move predicted ' + pct(A.predictionAccuracy, 0) + ' of the time (' + A.predictions + ' exchanges)', 840, 324);
+      // 3. predictability
+      panel(820, 350, 420, 140);
+      heading('Predictability score', 840, 378, 13);
+      ctx.font = font(54, 2); ctx.fillStyle = COL.text; ctx.textAlign = 'left';
+      var scoreText = A.predictability == null ? '-' : String(A.predictability), scoreW = ctx.measureText(scoreText).width;
+      ctx.fillText(scoreText, 840, 446);
+      ctx.font = font(16, false); ctx.fillStyle = COL.dim; ctx.fillText('/ 100', 840 + scoreW + 8, 446);
+      ctx.font = font(13, false);
+      ctx.fillText(A.entropyBits == null ? 'Not enough techniques thrown' : 'Entropy of your choices: ' + A.entropyBits.toFixed(2) + ' bits per technique', 840, 474);
+      ctx.fillText('Reads against you: ' + A.reads, 1080, 446);
+      // 4. weight cuts
+      panel(40, 452, 760, 120);
+      heading('Weight cut', 60, 480, 13);
+      drawCutBars(60, 500, r.playerCut, r.opponentCut, r.opponentName);
+      panel(820, 502, 420, 70);
+      ctx.font = font(13, false); ctx.fillStyle = COL.dim; ctx.textAlign = 'left';
+      ctx.fillText('Division average cut ' + pct(r.divisionAverageBefore) + '  to  ' + pct(r.divisionAverageAfter), 840, 532);
+      ctx.fillText('after this week\'s off-screen bouts', 840, 554);
+      if (r.rounds && r.rounds.length) {
+        ctx.fillStyle = COL.faint; ctx.font = font(12, false);
+        ctx.fillText('Points by round (you - them): ' + r.rounds.map(function (x) { return x.pointsPlayer.toFixed(0) + '-' + x.pointsOpponent.toFixed(0); }).join('   '), 60, 600);
+      }
+      var s = this; this.buttons.forEach(function (b, i) { drawButton(b, s.state.focus === i); });
+    }
+  };
+  function sumObj(o) { var s = 0; Object.keys(o || {}).forEach(function (k) { s += o[k]; }); return s; }
+  function drawMixGroup(x, y, w, h, band, acts, mixes, n) {
+    ctx.textAlign = 'center'; ctx.font = font(13, true); ctx.fillStyle = COL.text; spaced(2);
+    ctx.fillText(band.toUpperCase(), x + w / 2, y); spaced(0);
+    ctx.font = font(11, false); ctx.fillStyle = COL.faint; ctx.fillText('n = ' + n, x + w / 2, y + 16);
+    var top = y + 30, hh = h - 70;
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.lineWidth = 1;
+    [0, 0.5, 1].forEach(function (v) { ctx.beginPath(); ctx.moveTo(x, top + hh - hh * v); ctx.lineTo(x + w, top + hh - hh * v); ctx.stroke(); });
+    acts.forEach(function (a, i) {
+      var cx = x + 10 + i * 44 + 22, m = mixes[a];
+      var ph = hh * m.player, eh = hh * m.equilibrium;
+      ctx.fillStyle = n ? COL.blue : 'rgba(79,143,255,0.25)'; ctx.fillRect(cx - 13, top + hh - ph, 26, ph);
+      ctx.fillStyle = COL.gold; ctx.fillRect(cx - 19, top + hh - eh - 1.5, 38, 3);
+      ctx.fillStyle = COL.dim; ctx.font = font(10, false);
+      ctx.fillText(shortLabel(a), cx, top + hh + 14);
+      ctx.fillStyle = COL.faint; ctx.fillText(Math.round(m.player * 100) + '/' + Math.round(m.equilibrium * 100), cx, top + hh + 28);
+    });
+  }
+  function shortLabel(a) { return { punch: 'Punch', elbow: 'Elbow', teep: 'Teep', low: 'Low', body: 'Body', knee: 'Knee', head: 'Head', cknee: 'Knee', pull: 'Pull', shift: 'Shift' }[a] || a; }
+  function drawAccuracy(x, y, w, h, series) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.1)'; ctx.lineWidth = 1; ctx.font = font(11, false); ctx.fillStyle = COL.faint; ctx.textAlign = 'right';
+    [0, 0.5, 1].forEach(function (v) { var yy = y + h - h * v; ctx.beginPath(); ctx.moveTo(x, yy); ctx.lineTo(x + w, yy); ctx.stroke(); ctx.fillText(Math.round(v * 100) + '%', x - 4, yy + 4); });
+    ctx.textAlign = 'left'; ctx.fillText('First exchange', x, y + h + 16); ctx.textAlign = 'right'; ctx.fillText('Last exchange', x + w, y + h + 16);
+    if (!series || series.length < 2) return;
+    ctx.strokeStyle = COL.cyan; ctx.lineWidth = 2; ctx.beginPath();
+    series.forEach(function (v, i) { var xx = x + w * i / (series.length - 1), yy = y + h - h * v; if (i) ctx.lineTo(xx, yy); else ctx.moveTo(xx, yy); });
+    ctx.stroke();
+  }
+  function drawCutBars(x, y, pc, oc, oname) {
+    [[pc, 'You', COL.blue], [oc, oname, COL.red]].forEach(function (r, i) {
+      var yy = y + i * 30;
+      ctx.font = font(13, false); ctx.fillStyle = COL.dim; ctx.textAlign = 'left'; ctx.fillText(r[1], x, yy + 12);
+      ctx.fillStyle = '#2a2420'; ctx.fillRect(x + 210, yy, 400, 14);
+      ctx.fillStyle = r[2]; ctx.fillRect(x + 210, yy, 400 * r[0] / EL.CUT_MAX, 14);
+      ctx.fillStyle = COL.text; ctx.fillText(pct(r[0]), x + 620, yy + 12);
+    });
+  }
+
+  /* ---------- Career summary ---------- */
+  var careerScreen = {
+    state: { focus: 0 }, buttons: [],
+    enter: function () {
+      this.buttons = [Button('Download data', 60, 650, 240, 48, downloadData, true), Button('Title', 1060, 650, 160, 48, function () { setScreen(titleScreen); })];
+      this.state.focus = 0;
+    },
+    update: function (dt, presses) { if (presses.indexOf('Escape') >= 0) { setScreen(titleScreen); return; } menuKeys(presses, this.buttons, this.state); },
+    onDown: function (x, y) { this.buttons.forEach(function (b) { if (inside(b, x, y)) b.action(); }); },
+    render: function (t) {
+      menuBackdrop(t, 0.84, false);
+      ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left';
+      heading('Career summary', 60, 50, 18);
+      var R = career.record;
+      ctx.font = font(26, 2); ctx.fillStyle = career.complete ? COL.gold : COL.text;
+      ctx.fillText(career.complete ? 'Champion.  Record ' + R.wins + '-' + R.losses + ', ' + R.kos + ' by knockout' : 'Record ' + R.wins + '-' + R.losses, 60, 88);
+      var fs = career.fights;
+      var avg = function (key) { var v = fs.map(function (f) { return f.analysis[key]; }).filter(function (x) { return x != null; }); return v.length ? v.reduce(function (a, b) { return a + b; }, 0) / v.length : null; };
+      var avgPred = avg('predictability'), avgAcc = avg('predictionAccuracy');
+      var avgCut = fs.length ? fs.reduce(function (a, f) { return a + f.playerCut; }, 0) / fs.length : 0;
+      var reads = fs.reduce(function (a, f) { return a + (f.analysis.reads || 0); }, 0);
+      panel(40, 108, 560, 150);
+      ctx.font = font(15, false); ctx.fillStyle = COL.dim;
+      [['Fights', String(fs.length)], ['Average predictability score', avgPred == null ? '-' : avgPred.toFixed(0) + ' / 100'],
+        ['Average prediction accuracy against you', avgAcc == null ? '-' : pct(avgAcc, 0)], ['Total reads against you', String(reads)], ['Your average weight cut', pct(avgCut)]]
+        .forEach(function (r, i) { ctx.fillStyle = COL.dim; ctx.fillText(r[0], 64, 140 + i * 25); ctx.fillStyle = COL.text; ctx.fillText(r[1], 430, 140 + i * 25); });
+      drawTrend(660, 146, 520, 100, career.division.history, 'Division average cut over your career');
+      panel(40, 276, 1200, 360);
+      heading('Fight log', 60, 304, 13);
+      var cols = [60, 330, 450, 610, 720, 830, 960, 1090];
+      ['Opponent', 'Result', 'Method', 'Your cut', 'Their cut', 'Predictability', 'AI accuracy', 'Reads'].forEach(function (h, i) { ctx.font = font(12, true); ctx.fillStyle = COL.faint; ctx.fillText(h.toUpperCase(), cols[i], 330); });
+      fs.slice(-11).forEach(function (f, i) {
+        var y = 356 + i * 25;
+        ctx.font = font(14, false);
+        var cells = [f.opponentName, f.result === 'win' ? 'Win' : 'Loss', f.method === 'KO' ? 'KO round ' + f.endRound : 'Decision', pct(f.playerCut), pct(f.opponentCut),
+          f.analysis.predictability == null ? '-' : String(f.analysis.predictability), f.analysis.predictionAccuracy == null ? '-' : pct(f.analysis.predictionAccuracy, 0), String(f.analysis.reads || 0)];
+        cells.forEach(function (c, j) { ctx.fillStyle = j === 1 ? (f.result === 'win' ? COL.gold : '#ff8a7e') : COL.text; ctx.fillText(c, cols[j], y); });
+      });
+      var s = this; this.buttons.forEach(function (b, i) { drawButton(b, s.state.focus === i); });
+    }
+  };
+
+  /* ---------- Data export ---------- */
+  function downloadData() {
+    try {
+      var eqOut = {};
+      EL.BANDS.forEach(function (b) { eqOut[b] = { attackMix: EQ[b].attack, defenceMix: EQ[b].defence, value: EQ[b].value, dualityGap: EQ[b].gap, iterations: EQ[b].iterations }; });
+      var data = {
+        game: 'Eight Limbs', exportedAt: new Date().toISOString(),
+        equilibrium: eqOut, payoffMatrices: MATRICES,
+        opponents: EL.OPPONENTS.map(function (o) { return { id: o.id, name: o.name, gym: o.gym, style: o.style, learningFactor: o.learn, styleStrength: o.strength }; }),
+        weightCutModel: { cut: EL.CUT, absorb: EL.ABSORB, payoff: EL.PAYOFF },
+        career: career
+      };
+      var blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      var url = URL.createObjectURL(blob);
+      var link = document.createElement('a');
+      link.href = url; link.download = 'eight-limbs-data-' + new Date().toISOString().slice(0, 10) + '.json';
+      document.body.appendChild(link); link.click();
+      setTimeout(function () { URL.revokeObjectURL(url); if (link.parentNode) link.parentNode.removeChild(link); }, 1000);
+    } catch (e) { console.warn('Export failed', e); }
+  }
+
+  /* ---------- Screens and main loop ---------- */
+  var screen = null;
+  function setScreen(s) { screen = s; if (s.enter) s.enter(); }
+
+  var last = 0, acc = 0, realT = 0;
+  function frame(now) {
+    var dtMs = last ? Math.min(100, now - last) : 16;
+    last = now;
+    var dt = dtMs / 1000;
+    realT += dt;
+    if (slowMo > 0) { slowMo -= dt; timeScale = 0.25; } else timeScale = 1;
+    var steps = 0;
+    if (hitStop > 0) hitStop -= dt;
+    else {
+      acc += dt * timeScale;
+      steps = Math.floor(acc / STEP);
+      if (steps > 12) { steps = 12; acc = 0; }
+      acc -= steps * STEP;
+    }
+    if (window.EightLimbs.freeze) steps = 0;
+    var presses = pressedQ.splice(0);
+    if (screen === fightScreen && steps === 0) {
+      // keep fight inputs until the simulation can consume them, but menus never stall
+      var keep = presses.filter(function (c) { return c !== 'Escape'; });
+      if (presses.indexOf('Escape') >= 0 && F && !F.paused) F.paused = true;
+      else if (presses.indexOf('Escape') >= 0 && F) F.paused = false;
+      pressedQ = keep.concat(pressedQ);
+      presses = [];
+    }
+    try {
+      if (screen === fightScreen) {
+        for (var i = 0; i < steps; i++) { if (screen !== fightScreen) break; screen.update(STEP, i === 0 ? presses : []); }
+      } else if (screen && screen.update) screen.update(dt, presses);
+      cam.shake = Math.max(0, cam.shake - dt * 40) * Math.exp(-dt * 6);
+      Sound.update(dt);
+      baseTransform();
+      if (screen) screen.render(realT);
+    } catch (err) {
+      console.error(err);
+    }
+    requestAnimationFrame(frame);
+  }
+
+  // test hooks for automated checks (no gameplay effect)
+  window.EightLimbs = {
+    EQ: EQ, MATRICES: MATRICES,
+    get fight() { return F; }, get career() { return career; }, get screen() { return screen; },
+    screens: { title: titleScreen, ladder: ladderScreen, weigh: weighScreen, fight: fightScreen, analysis: analysisScreen, career: careerScreen },
+    startFight: function (i, pc, oc) { if (!career) { career = newCareer(); } startFight(i, pc, oc); },
+    step: function (n, presses) { for (var i = 0; i < n; i++) { if (screen !== fightScreen) return; fightUpdate(STEP, i === 0 ? (presses || []) : []); } },
+    hold: function (code, down) { keys[code] = !!down; },
+    forceAttack: function (f, type, d) { f.state = 'free'; return startAttack(f, type, d || { action: type, mode: 'style', predicted: null, confidence: 0 }); },
+    forceClinch: function () { tryClinch(F.p, F.a); },
+    press: function (code) { pressedQ.push(code); }
+  };
+
+  setScreen(titleScreen);
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
