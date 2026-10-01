@@ -651,8 +651,10 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
   var DPR = 1, VS = 1, VX = 0, VY = 0;
   var bgCanvas = null;
   function resize() {
-    DPR = Math.min(2, window.devicePixelRatio || 1);
     var w = window.innerWidth, h = window.innerHeight;
+    // cap the backing store so very large or high-density screens stay at 60fps
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    if (w * DPR > 2048) DPR = 2048 / Math.max(1, w);
     cv.width = Math.max(1, Math.round(w * DPR)); cv.height = Math.max(1, Math.round(h * DPR));
     cv.style.width = w + 'px'; cv.style.height = h + 'px';
     VS = Math.min(w / W, h / H); VX = (w - W * VS) / 2; VY = (h - H * VS) / 2;
@@ -976,7 +978,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
   // which joint strikes (for telegraph glow and hit sparks)
   var STRIKER = { punch: 'lHand', cross: 'rHand', elbow: 'rElbow', body: 'rAnkle', head: 'rAnkle', low: 'rAnkle', teep: 'lAnkle', knee: 'rKnee' };
   var LUNGE = { punch: 10, elbow: 10, teep: 4, low: 8, body: 6, head: 6, knee: 16 };
-  var PUSH = { punch: 10, elbow: 14, teep: 95, low: 6, body: 20, head: 30, knee: 22 };
+  var PUSH = { punch: 10, elbow: 14, teep: 165, low: 6, body: 20, head: 30, knee: 22 };
   var HIT_HEIGHT = { punch: 0.82, elbow: 0.86, teep: 0.5, low: 0.25, body: 0.55, head: 0.9, knee: 0.5 };
 
   function blendPose(a, b, t) { var p = {}; P_KEYS.forEach(function (k) { p[k] = a[k] + (b[k] - a[k]) * t; }); return p; }
@@ -1057,7 +1059,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
         limb(J.neck, along(J.neck, J.head, 0.55), 13 * s + g, 12 * s + g);
         dot(J.head, SK.headR * s + g / 2);
         // jaw, so the head reads as facing the opponent
-        dot({ x: J.head.x + (J.neck.x < J.head.x ? 1 : -1) * 0 + (J.lSh.x > J.rSh.x ? 1 : -1) * 6 * s, y: J.head.y + 7 * s }, 9 * s + g / 2);
+        dot({ x: J.head.x + (J.lSh.x > J.rSh.x ? 1 : -1) * 6 * s, y: J.head.y + 7 * s }, 9 * s + g / 2);
         break;
     }
   }
@@ -1143,12 +1145,12 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
   function buildBackground() {
     var c = document.createElement('canvas');
     var sc = DPR * VS;
-    c.width = Math.max(1, Math.round(BG_W * sc)); c.height = Math.max(1, Math.round(H * sc));
+    c.width = Math.max(1, Math.round(BG_W * sc)); c.height = Math.max(1, Math.round((H + 16) * sc));
     var g = c.getContext('2d');
-    g.setTransform(sc, 0, 0, sc, 0, 0);
+    g.setTransform(sc, 0, 0, sc, 0, 8 * sc);
     var sky = g.createLinearGradient(0, 0, 0, H);
     sky.addColorStop(0, '#060507'); sky.addColorStop(0.35, '#120d0a'); sky.addColorStop(0.75, '#1c140e'); sky.addColorStop(1, '#0a0806');
-    g.fillStyle = sky; g.fillRect(0, 0, BG_W, H);
+    g.fillStyle = sky; g.fillRect(0, -8, BG_W, H + 16);
     // roof trusses
     g.strokeStyle = 'rgba(70,52,36,0.35)'; g.lineWidth = 3;
     for (var x = -40; x < BG_W; x += 120) { g.beginPath(); g.moveTo(x, 0); g.lineTo(x + 60, 70); g.lineTo(x + 120, 0); g.stroke(); }
@@ -1194,25 +1196,28 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
   function drawBackdrop(camX) {
     if (!bgCanvas) buildBackground();
     var off = -(camX - 640) * 0.35 - (BG_W - W) / 2;
-    ctx.save();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.fillStyle = '#050405'; ctx.fillRect(0, 0, cv.width, cv.height);
-    ctx.restore();
     baseTransform();
-    ctx.drawImage(bgCanvas, 0, 0, bgCanvas.width, bgCanvas.height, off, crowdBob, BG_W, H);
+    ctx.drawImage(bgCanvas, 0, 0, bgCanvas.width, bgCanvas.height, off, crowdBob - 8, BG_W, H + 16);
   }
   var crowdBob = 0;
   var dust = [];
   for (var di = 0; di < 46; di++) dust.push({ x: rand(250, 1030), y: rand(90, 560), v: rand(4, 12), p: rand(0, 6) });
-  function drawLights(t) {
-    ctx.save();
-    ctx.globalCompositeOperation = 'lighter';
+  function drawCones() {
     [[430, 0.07], [640, 0.1], [850, 0.07]].forEach(function (L) {
       var g = ctx.createLinearGradient(0, 60, 0, 600);
       g.addColorStop(0, 'rgba(255,205,140,' + L[1] + ')'); g.addColorStop(1, 'rgba(255,160,80,0)');
       ctx.fillStyle = g; ctx.beginPath();
       ctx.moveTo(L[0] - 18, 60); ctx.lineTo(L[0] + 18, 60); ctx.lineTo(L[0] + 230, 600); ctx.lineTo(L[0] - 230, 600); ctx.closePath(); ctx.fill();
     });
+  }
+  function drawStage(t) {
+    ctx.save(); ctx.globalCompositeOperation = 'lighter'; drawCones(); ctx.restore();
+    drawDust(t);
+    drawRingBack();
+  }
+  function drawStageFront() { drawRingFront(); }
+  function drawDust(t) {
+    ctx.save();
     ctx.fillStyle = 'rgba(255,220,170,0.5)';
     dust.forEach(function (m) {
       var y = (m.y - t * m.v) % 520; if (y < 80) y += 480;
@@ -1351,7 +1356,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
       round: 1, clock: ROUND_TIME, phase: 'intro', phaseT: 0, time: 0,
       predictor: new EL.Predictor(), prev: 'none', mixes: EL.styleMixes(EQ, opp), rng: EL.makeRng(seed),
       exchanges: [], rounds: [], kd: { p: 0, a: 0 }, clinch: null, caught: null, result: null,
-      started: new Date().toISOString(), confT: 0, paused: false
+      started: new Date().toISOString(), confT: 0
     };
     F.a.brain = { moveT: 0, atkT: 1.4, plan: null, guardUntil: 0, phase: Math.random() * 6, dumpT: 0 };
     Sound.intensity = 0.1; Sound.roundBoost = 0;
@@ -1620,7 +1625,6 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
     }
   }
   function dump(winner, loser) {
-    var C = F.clinch;
     breakClinch(null);
     winner.pts += 5 * winner.power;
     setState(loser, 'down'); loser.downDur = 1.0;
@@ -1633,7 +1637,6 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
     logExchange({ t: +F.time.toFixed(2), time: new Date().toISOString(), round: F.round, band: 'clinch', initiator: 'clinch',
       playerAction: winner === F.p ? 'dump' : 'none', aiPrediction: null, aiAction: winner === F.a ? 'dump' : 'none', aiMode: null,
       confidence: null, outcome: winner === F.p ? 'player dumped opponent' : 'opponent dumped player', value: winner === F.p ? 5 : -5, read: false });
-    void C;
   }
   function breakClinch(label) {
     if (!F.clinch) return;
@@ -1679,7 +1682,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
     var dist = Math.abs(def.x - att.x);
     var dState = defenceOf(def);
     var outcome, v;
-    if (!EL.attackValidIn(band, type)) { outcome = dist > T.reach + att.reach ? 'missed' : 'jammed'; v = -0.5; }
+    if (!EL.attackValidIn(band, type)) { outcome = tooClose(band, type) ? 'jammed' : 'missed'; v = -0.5; }
     else if (dist > T.reach + att.reach + 36 && dState !== 'step') { outcome = 'missed'; v = -0.5; }
     else { outcome = EL.outcomeType(band, type, dState); v = EL.outcomeValue(band, type, dState); }
     var hp = strikePoint(att, def, type), dirX = att.facing;
@@ -1758,6 +1761,13 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
       if (ex.read) readPopup();
     }
     finishExchange(att, def, ex, v, dState, outcome);
+  }
+  // out of its range band: jammed if the opponent is too close for it, missed if too far
+  var BAND_ORDER = ['close', 'mid', 'long', 'out'];
+  function tooClose(band, type) {
+    var i = BAND_ORDER.indexOf(band);
+    for (var j = i + 1; j < BAND_ORDER.length; j++) if (EL.attackValidIn(BAND_ORDER[j], type)) return true;
+    return false;
   }
   function finishExchange(att, def, ex, v, dState, outcome) {
     if (!ex) return;
@@ -1916,11 +1926,6 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
 
   /* ---------- Fight update ---------- */
   function fightUpdate(dt, presses) {
-    if (F.paused) {
-      presses.forEach(function (c) { if (c === 'Escape' || c === 'Enter') F.paused = false; });
-      return;
-    }
-    if (presses.indexOf('Escape') >= 0 && (F.phase === 'fight' || F.phase === 'intro')) { F.paused = true; return; }
     F.phaseT += dt;
     var p = F.p, a = F.a;
     if (F.phase === 'intro') {
@@ -2042,12 +2047,11 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
     ctx.restore();
     ctx.save();
     ctx.translate(W / 2 + sx, 430 + sy); ctx.scale(cam.z, cam.z); ctx.translate(-cam.x, -430);
-    drawLights(realT);
-    drawRingBack();
+    drawStage(realT);
     var order = (a.state === 'attack' || a.state === 'counter') ? [p, a] : [a, p];
     order.forEach(drawFighter);
     drawFx();
-    drawRingFront();
+    drawStageFront();
     drawPopups();
     ctx.restore();
     drawHud();
@@ -2097,11 +2101,6 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
     if (F.phase === 'roundEnd') roundEndCard();
     if (F.phase === 'ko' && F.phaseT > 0.6) koCard();
     if (F.phase === 'decision') decisionCard();
-    if (F.paused) {
-      ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, 0, W, H);
-      ctx.textAlign = 'center'; ctx.fillStyle = COL.text; ctx.font = font(48, 2); ctx.fillText('PAUSED', W / 2, H / 2);
-      ctx.font = font(18, false); ctx.fillStyle = COL.dim; ctx.fillText('Press Enter or Esc to resume', W / 2, H / 2 + 40);
-    }
   }
   function drawClinchHud() {
     var C = F.clinch, cx = W / 2, y = 150, w = 360;
@@ -2195,12 +2194,11 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
     crowdBob = Math.sin(t * 1.4) * 1;
     drawBackdrop(640);
     ctx.save();
-    ctx.translate(W / 2, 430); ctx.scale(1.0, 1.0); ctx.translate(-640, -430);
-    drawLights(t); drawRingBack();
+    drawStage(t);
     if (fighters) {
       [showA, showP].forEach(function (f) { f.bob += 0.016 * 3; animate(f, 1 / 60); drawFighter(f); });
     }
-    drawRingFront();
+    drawStageFront();
     ctx.restore();
     ctx.fillStyle = 'rgba(5,4,3,' + dim + ')'; ctx.fillRect(0, 0, W, H);
   }
@@ -2367,8 +2365,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
       ctx.font = font(14, false); ctx.fillStyle = COL.dim; ctx.textAlign = 'left';
       ctx.fillText('Lightweight limit ' + BASE_WEIGHT.toFixed(1) + ' kg.  You against ' + o.name + ', ' + o.gym + '.', 60, 84);
       var rk = s.revealed ? easeOut(s.revealT / 1.3) : 0;
-      drawScale(250, 330, 'YOU', s.cut, COL.blue, 1, false);
-      drawScale(1030, 330, o.name.split(' ')[0].toUpperCase(), s.revealed ? s.oppCut * rk + Math.sin(s.revealT * 20) * 0.01 * (1 - rk) : 0, COL.red, rk, !s.revealed);
+      drawScale(250, 330, 'YOU', s.cut, COL.blue, false);
+      drawScale(1030, 330, o.name.split(' ')[0].toUpperCase(), s.revealed ? s.oppCut * rk + Math.sin(s.revealT * 20) * 0.01 * (1 - rk) : 0, COL.red, !s.revealed);
       // slider
       var S = s.slider;
       ctx.globalAlpha = s.revealed ? 0.45 : 1;
@@ -2394,7 +2392,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
       var s2 = this; this.buttons.forEach(function (b, i) { drawButton(b, s2.state.focus === i); });
     }
   };
-  function drawScale(cx, cy, label, cut, colour, reveal, hidden) {
+  function drawScale(cx, cy, label, cut, colour, hidden) {
     panel(cx - 170, cy - 170, 340, 260);
     ctx.textAlign = 'center';
     ctx.font = font(16, 2); ctx.fillStyle = colour; spaced(2); ctx.fillText(label, cx, cy - 140); spaced(0);
@@ -2417,7 +2415,6 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
       ctx.font = font(13, false); ctx.fillStyle = COL.dim;
       ctx.fillText('On the scale ' + BASE_WEIGHT.toFixed(1) + ' kg   Fight night ' + walking.toFixed(1) + ' kg', cx, cy + 74);
     }
-    void reveal;
   }
   function drawMods(x, y, m) {
     ctx.textAlign = 'left'; ctx.font = font(14, false);
@@ -2631,11 +2628,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
     if (window.EightLimbs.freeze) steps = 0;
     var presses = pressedQ.splice(0);
     if (screen === fightScreen && steps === 0) {
-      // keep fight inputs until the simulation can consume them, but menus never stall
-      var keep = presses.filter(function (c) { return c !== 'Escape'; });
-      if (presses.indexOf('Escape') >= 0 && F && !F.paused) F.paused = true;
-      else if (presses.indexOf('Escape') >= 0 && F) F.paused = false;
-      pressedQ = keep.concat(pressedQ);
+      // during hit stop, keep fight inputs until the simulation can consume them
+      pressedQ = presses.concat(pressedQ);
       presses = [];
     }
     try {
@@ -2645,7 +2639,10 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EL;
       cam.shake = Math.max(0, cam.shake - dt * 40) * Math.exp(-dt * 6);
       Sound.update(dt);
       baseTransform();
+      ctx.save();
+      ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.clip();
       if (screen) screen.render(realT);
+      ctx.restore();
     } catch (err) {
       console.error(err);
     }
