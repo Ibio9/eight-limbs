@@ -556,7 +556,7 @@ var EL = (function () {
     exchanges.forEach(function (x) {
       var isPlayerChoice = (x.initiator === 'player' || x.initiator === 'clinch');
       if (isPlayerChoice && freq[x.band] && freq[x.band][x.playerAction] != null) { freq[x.band][x.playerAction]++; totals[x.band]++; }
-      if (x.aiPrediction && x.playerAction && BANDS.indexOf(x.band) >= 0) {
+      if (x.aiPrediction && x.playerAction && x.playerAction !== 'down' && BANDS.indexOf(x.band) >= 0) {
         n++; if (x.aiPrediction === x.playerAction) hits++;
         acc.push({ i: n, correct: x.aiPrediction === x.playerAction, t: x.t });
       }
